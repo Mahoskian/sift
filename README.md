@@ -1,3 +1,13 @@
+# SIFT
+
+> *Named after the SIFT algorithm (Scale-Invariant Feature Transform) — a landmark in computer vision for detecting and describing local image features. An homage to the field.*
+
+SIFT is a high-performance image and video processing tool — built in the spirit of [FFmpeg](https://ffmpeg.org/) and its creator [Fabrice Bellard](https://bellard.org/). Bellard's work on FFmpeg redefined what a small, focused, open-source multimedia tool could be: zero-compromise performance, minimal dependencies, and a CLI that does everything. That philosophy lives here.
+
+The domain is perceptual hashing and visual similarity — given a collection of images or videos, compress each file's visual identity into a compact hash, measure how visually similar files are to each other, cluster them by proximity, and surface the structure of your media library. Think of it as `ffmpeg` for understanding what's *in* your media, not just what format it's in.
+
+---
+
 # SIFT C++ Rewrite
 
 > **Language**: C++17, Linux-first (macOS/Windows later)
