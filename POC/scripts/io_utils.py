@@ -2,7 +2,6 @@
 # Soham Naik - 05/21/2025
 import os
 import shutil
-import numpy as np
 
 
 def restore_input_folder(output_dir, input_dir):
@@ -15,11 +14,12 @@ def restore_input_folder(output_dir, input_dir):
 
 
 def list_input_files(input_dir, mode):
-    IMG_EXTS = ('.jpg','.jpeg','.png','.bmp','.tiff','.webp')
-    VID_EXTS = ('.mp4','.avi','.mov','.mkv','.m4v')
-    exts = VID_EXTS if mode == 'video' else IMG_EXTS
+    IMG_EXTS = (".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".webp")
+    VID_EXTS = (".mp4", ".avi", ".mov", ".mkv", ".m4v")
+    exts = VID_EXTS if mode == "video" else IMG_EXTS
     return [
-        f for f in sorted(os.listdir(input_dir))
+        f
+        for f in sorted(os.listdir(input_dir))
         if os.path.isfile(os.path.join(input_dir, f)) and f.lower().endswith(exts)
     ]
 

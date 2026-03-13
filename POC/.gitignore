@@ -1,3 +1,10 @@
+# Python virtualenv
+venv/
+
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+
 # Distribution / packaging
 build/
 dist/

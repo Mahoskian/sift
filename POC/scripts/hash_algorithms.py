@@ -9,8 +9,7 @@ import imagehash
 def dhash_compute(image_gray: np.ndarray, hash_size: int) -> np.ndarray:
     # Difference hash on a grayscale array.
     resized = cv2.resize(
-        image_gray, (hash_size + 1, hash_size),
-        interpolation=cv2.INTER_AREA
+        image_gray, (hash_size + 1, hash_size), interpolation=cv2.INTER_AREA
     )
     diff = resized[:, 1:] > resized[:, :-1]
     return diff.ravel().astype(np.uint8)

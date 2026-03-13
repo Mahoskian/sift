@@ -75,7 +75,7 @@ if [ ! -d "$INPUT_DIR" ]; then
 fi
 
 # Build the command
-CMD=(python scripts/mediahash.py
+CMD=(uv run python scripts/mediahash.py
      --hash-type "$HASH_TYPE"
      --mode "$MEDIA"
      --input "$INPUT_DIR"

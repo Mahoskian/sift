@@ -15,7 +15,7 @@ def get_frame_indices(total_frames, sample_count):
 def cluster_hashes(hash_list, threshold):
     names = [n for n, _ in hash_list]
     vecs = np.array([v for _, v in hash_list])
-    dist_mat = squareform(pdist(vecs, metric='hamming')) * vecs.shape[1]
+    dist_mat = squareform(pdist(vecs, metric="hamming")) * vecs.shape[1]
     groups = []
     used = set()
     for i, name in enumerate(names):

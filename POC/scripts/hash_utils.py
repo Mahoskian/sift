@@ -10,6 +10,7 @@ from cluster_utils import get_frame_indices, average_hash_from_stack
 # Module‑scoped compute function (set by CLI)
 _compute_fn = None
 
+
 def set_compute_fn(fn):
     """Set the hash-compute function (dhash, phash, or whash)."""
     global _compute_fn
@@ -35,7 +36,7 @@ def hash_video(filename, input_dir, hash_size, frames_to_sample):
         hashes = []
         for idx, frame in enumerate(container.decode(stream)):
             if idx in indices:
-                arr = frame.to_ndarray(format='bgr24')
+                arr = frame.to_ndarray(format="bgr24")
                 gray = cv2.cvtColor(arr, cv2.COLOR_BGR2GRAY)
                 hashes.append(_compute_fn(gray, hash_size))
                 if len(hashes) >= frames_to_sample:
@@ -51,6 +52,6 @@ def hash_video(filename, input_dir, hash_size, frames_to_sample):
 def worker(task):
     """Top-level worker for multiprocessing (picklable)."""
     name, inp, mode, sz, fr = task
-    if mode == 'image':
+    if mode == "image":
         return hash_image(name, inp, sz)
     return hash_video(name, inp, sz, fr)
