@@ -1,6 +1,5 @@
-# PLAN.md — MediaHashCluster C++ Rewrite
+# SIFT C++ Rewrite
 
-> **Working title**: TBD (candidates: `sift`, `drift`, `flock`, `prism`, `vsift`)
 > **Language**: C++17, Linux-first (macOS/Windows later)
 > **Build system**: CMake
 > **License**: MIT (open source from day one)
@@ -219,7 +218,6 @@ is a window into the hash space, nothing more.
 
 ## Open Questions
 
-- [ ] Final project name
 - [ ] Hash output format: JSON (human-readable) vs binary (faster I/O for large datasets)? Maybe both.
 - [ ] Should the viz layer communicate with the CLI via files, pipes, or sockets?
 - [ ] SIMD strategy: SSE4.2 baseline? AVX2 optional? Runtime detection?
