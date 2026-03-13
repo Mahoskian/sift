@@ -135,10 +135,6 @@ def main():
     valid = [r for r in results if r]
     groups = cluster_hashes(valid, thresh)
 
-    # Graphing would go here:
-    # if args.graph:
-    #     plot_clusters(valid, groups)
-
     save_groups(groups, args.input_dir, args.output_dir, args.dry_run)
 
     print(f"Identified {len(groups)} groups")
