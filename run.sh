@@ -1,0 +1,3 @@
+cmake -B build -G Ninja    # configure
+cmake --build build        # compile
+./build/sift               # run
