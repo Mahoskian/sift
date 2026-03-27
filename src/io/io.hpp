@@ -3,12 +3,18 @@
 #include "cluster.hpp"
 
 #include <filesystem>
+#include <string>
 #include <vector>
 
-// Returns paths of all supported image files in the given directory.
 namespace io {
-    std::vector<std::filesystem::path> scan_images(const std::filesystem::path& dir);
-} // namespace sift
 
-// Moves grouped files into subdirectories of outputDir.
-void writeGroups(const std::vector<Group>& groups, const std::filesystem::path& outputDir);
+// Scan directory for supported image files.
+std::vector<std::filesystem::path> scan_images(const std::filesystem::path& dir);
+
+// Parse hash JSON (output of `sift hash`) into ClusterInput.
+ClusterInput parse_hash_json(const std::string& json_str);
+
+// Read entire file to string.
+std::string read_file(const std::string& path);
+
+} // namespace io
