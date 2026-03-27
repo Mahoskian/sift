@@ -1,6 +1,8 @@
 # Distribution / packaging
 build/
 dist/
+.temp/
+.cache/
 *.egg-info/
 
 # IDE / editor folders
