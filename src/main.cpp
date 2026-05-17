@@ -1,6 +1,7 @@
 #include "hash.hpp"
 #include "cluster.hpp"
 #include "io.hpp"
+#include "project.hpp"
 #include "threadpool.hpp"
 
 #include <filesystem>
@@ -20,8 +21,9 @@ using HashFn = std::function<HashResult(const std::string&, int)>;
 static void print_usage() {
     std::cerr <<
         "Usage:\n"
-        "  sift hash <dir> [options]       Compute perceptual hashes\n"
+        "  sift hash <dir> [options]        Compute perceptual hashes\n"
         "  sift cluster <file> [options]    Cluster hashes by similarity\n"
+        "  sift project <file> [options]    Project hashes to 2D/3D/ND\n"
         "\n"
         "Hash options:\n"
         "  --algo=<dhash|phash|whash>       Hash algorithm (default: dhash)\n"
@@ -45,7 +47,19 @@ static void print_usage() {
         "  sift cluster hashes.json --method=threshold --threshold=10\n"
         "  sift cluster hashes.json --method=hierarchical --linkage=complete --cut-height=15\n"
         "  sift cluster hashes.json --method=hdbscan --min-group=3\n"
-        "  sift hash ./photos | sift cluster - --threshold=5\n";
+        "  sift hash ./photos | sift cluster - --threshold=5\n"
+        "\n"
+        "Project options:\n"
+        "  --method=<pca|tsne>              Projection method (default: pca)\n"
+        "  --dims=<N>                       Output dimensions (default: 3)\n"
+        "  --perplexity=<N>                 t-SNE perplexity (default: 30)\n"
+        "  --iterations=<N>                 t-SNE max iterations (default: 1000)\n"
+        "  --learning-rate=<N>              t-SNE learning rate (default: 200)\n"
+        "  --output=<file>                  Output JSON file (default: stdout)\n"
+        "\n"
+        "Project examples:\n"
+        "  sift project hashes.json --method=pca --dims=3\n"
+        "  sift project hashes.json --method=tsne --dims=2 --perplexity=15\n";
 }
 
 // ─── JSON output: hash ──────────────────────────────────────────────────────
@@ -490,6 +504,159 @@ static int cmd_cluster(int argc, char* argv[]) {
     return 0;
 }
 
+// ─── JSON output: project ───────────────────────────────────────────────────
+
+static void write_project_json(
+    std::ostream& out,
+    const ClusterInput& input,
+    const ProjectionResult& proj
+) {
+    out << "{\n";
+    out << "  \"algorithm\": \"" << input.algorithm << "\",\n";
+    out << "  \"hash_size\": " << input.hash_size << ",\n";
+    out << "  \"hash_bits\": " << input.hash_bits << ",\n";
+    out << "  \"method\": \"" << proj.method << "\",\n";
+    out << "  \"dims\": " << proj.dims << ",\n";
+
+    // Files
+    out << "  \"files\": [";
+    for (size_t i = 0; i < input.files.size(); i++) {
+        out << "\"" << input.files[i] << "\"";
+        if (i + 1 < input.files.size()) out << ", ";
+    }
+    out << "],\n";
+
+    // Points
+    out << "  \"points\": [\n";
+    for (size_t i = 0; i < proj.points.size(); i++) {
+        out << "    [";
+        for (int d = 0; d < proj.dims; d++) {
+            out << proj.points[i][d];
+            if (d + 1 < proj.dims) out << ", ";
+        }
+        out << "]";
+        if (i + 1 < proj.points.size()) out << ",";
+        out << "\n";
+    }
+    out << "  ]";
+
+    // PCA-specific: variance explained
+    if (!proj.variance_explained.empty()) {
+        out << ",\n  \"variance_explained\": [";
+        for (size_t i = 0; i < proj.variance_explained.size(); i++) {
+            out << proj.variance_explained[i];
+            if (i + 1 < proj.variance_explained.size()) out << ", ";
+        }
+        out << "]";
+    }
+
+    out << "\n}\n";
+}
+
+// ─── Subcommand: project ────────────────────────────────────────────────────
+
+static int cmd_project(int argc, char* argv[]) {
+    std::string input_file;
+    std::string method = "pca";
+    int dims = 3;
+    double perplexity = 30.0;
+    int iterations = 1000;
+    double learning_rate = 200.0;
+    std::string output_file;
+
+    static struct option long_opts[] = {
+        {"method",        required_argument, 0, 'm'},
+        {"dims",          required_argument, 0, 'd'},
+        {"perplexity",    required_argument, 0, 'p'},
+        {"iterations",    required_argument, 0, 'i'},
+        {"learning-rate", required_argument, 0, 'r'},
+        {"output",        required_argument, 0, 'o'},
+        {"help",          no_argument,       0, 'h'},
+        {0, 0, 0, 0}
+    };
+
+    optind = 1;
+    int opt;
+    while ((opt = getopt_long(argc, argv, "m:d:p:i:r:o:h", long_opts, nullptr)) != -1) {
+        switch (opt) {
+            case 'm': method = optarg; break;
+            case 'd': dims = std::stoi(optarg); break;
+            case 'p': perplexity = std::stod(optarg); break;
+            case 'i': iterations = std::stoi(optarg); break;
+            case 'r': learning_rate = std::stod(optarg); break;
+            case 'o': output_file = optarg; break;
+            case 'h': print_usage(); return 0;
+            default:  print_usage(); return 1;
+        }
+    }
+
+    if (optind < argc) input_file = argv[optind];
+
+    if (input_file.empty()) {
+        std::cerr << "sift: no input hash file specified (use - for stdin)\n";
+        return 1;
+    }
+    if (dims < 1) {
+        std::cerr << "sift: dims must be >= 1\n";
+        return 1;
+    }
+
+    // Read and parse hash JSON
+    std::cerr << "sift: reading hashes from "
+              << (input_file == "-" ? "stdin" : input_file) << "\n";
+
+    std::string json_str = io::read_file(input_file);
+    ClusterInput input = io::parse_hash_json(json_str);
+
+    int n = (int)input.files.size();
+    std::cerr << "sift: loaded " << n << " hashes ("
+              << input.algorithm << " " << input.hash_size << "x" << input.hash_size << ")\n";
+
+    // Convert hashes to feature vectors
+    std::vector<std::string> hex_hashes;
+    for (auto& h : input.hashes) hex_hashes.push_back(h.to_hex());
+    auto features = hashes_to_features(hex_hashes, input.hash_bits);
+
+    // Run projection
+    auto t_start = std::chrono::steady_clock::now();
+
+    ProjectionResult proj;
+    if (method == "pca") {
+        proj = pca_project(features, dims);
+        std::cerr << "sift: PCA variance explained:";
+        for (int d = 0; d < proj.dims; d++)
+            std::cerr << " " << (proj.variance_explained[d] * 100.0) << "%";
+        std::cerr << "\n";
+    } else if (method == "tsne") {
+        std::cerr << "sift: running t-SNE (dims=" << dims
+                  << ", perplexity=" << perplexity
+                  << ", iterations=" << iterations << ")\n";
+        proj = tsne_project(features, dims, perplexity, iterations, learning_rate);
+    } else {
+        std::cerr << "sift: unknown method '" << method << "'\n";
+        return 1;
+    }
+
+    proj.files = input.files;
+
+    auto t_end = std::chrono::steady_clock::now();
+    double elapsed_ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
+    std::cerr << "sift: projected " << n << " points to " << dims << "D in "
+              << elapsed_ms << " ms\n";
+
+    // Output
+    if (output_file.empty()) {
+        write_project_json(std::cout, input, proj);
+    } else {
+        std::ofstream ofs(output_file);
+        if (!ofs) { std::cerr << "sift: cannot open: " << output_file << "\n"; return 1; }
+        write_project_json(ofs, input, proj);
+        std::cerr << "sift: wrote " << output_file << "\n";
+    }
+
+    return 0;
+}
+
 // ─── Main ───────────────────────────────────────────────────────────────────
 
 int main(int argc, char* argv[]) {
@@ -510,6 +677,7 @@ int main(int argc, char* argv[]) {
 
     if (subcommand == "hash")    return cmd_hash(argc, argv);
     if (subcommand == "cluster") return cmd_cluster(argc, argv);
+    if (subcommand == "project") return cmd_project(argc, argv);
 
     std::cerr << "sift: unknown command '" << subcommand << "'\n";
     print_usage();

@@ -19,6 +19,8 @@ add_executable(sift
   src/io/scanner.cpp
   src/io/json_parse.cpp
   src/io/writer.cpp
+  src/project/pca.cpp
+  src/project/tsne.cpp
 )
 
 target_include_directories(sift PRIVATE
@@ -27,6 +29,7 @@ target_include_directories(sift PRIVATE
   src/cluster
   src/io
   src/core
+  src/project
 )
 
 target_compile_options(sift PRIVATE -Wall -Wextra -O2)
