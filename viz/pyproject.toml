@@ -1,0 +1,13 @@
+[project]
+name = "sift-viz"
+version = "0.1.0"
+description = "Interactive visualization frontend for the sift perceptual hashing CLI"
+requires-python = ">=3.13"
+dependencies = [
+    "matplotlib>=3.10.9",
+    "numpy>=2.4.5",
+    "scipy>=1.17.1",
+]
+
+[project.scripts]
+sift-viz = "visualize:main"
