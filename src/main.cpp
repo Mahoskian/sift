@@ -6,9 +6,12 @@
 #include "project.hpp"
 #include "threadpool.hpp"
 
+#include <atomic>
+#include <cstdio>
 #include <filesystem>
 #include <iostream>
 #include <fstream>
+#include <mutex>
 #include <string>
 #include <vector>
 #include <functional>
@@ -379,6 +382,19 @@ static int cmd_hash(int argc, char* argv[]) {
     auto frame_source = io::make_frame_source(strategy, n_frames);
 
     {
+        std::atomic<int> done_count{0};
+        std::mutex progress_mtx; // serialises multi-token stderr writes
+
+        auto emit_progress = [&]() {
+            int cnt = ++done_count;
+            char buf[80];
+            int len = std::snprintf(buf, sizeof(buf),
+                                    "sift: progress %d/%d\n", cnt, total_files);
+            std::lock_guard<std::mutex> lk(progress_mtx);
+            std::fwrite(buf, 1, static_cast<size_t>(len), stderr);
+            std::fflush(stderr);
+        };
+
         ThreadPool pool(num_threads);
         std::vector<std::future<void>> futures;
 
@@ -388,6 +404,7 @@ static int cmd_hash(int argc, char* argv[]) {
                 std::string path_str = images[i].string();
                 HashResult h = hash_fn(path_str, hash_size);
                 results[i] = {path_str, std::move(h)};
+                emit_progress();
             }));
         }
 
@@ -397,6 +414,7 @@ static int cmd_hash(int argc, char* argv[]) {
             futures.push_back(pool.submit([&, i, offset]() {
                 HashResult h = hash_video(videos[i], *frame_source, hash_fn, hash_size);
                 results[offset + i] = {videos[i].string(), std::move(h)};
+                emit_progress();
             }));
         }
 

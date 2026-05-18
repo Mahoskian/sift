@@ -459,6 +459,8 @@ class SiftViz(tk.Tk):
         self._projection_data: dict | None = None
         self._cluster_data: dict | None = None
         self._running = False
+        self._cancel_requested = False
+        self._current_proc: subprocess.Popen | None = None
         self._cluster_timer: str | None = None
         self._poll_id: str | None = None
 
@@ -685,7 +687,7 @@ class SiftViz(tk.Tk):
         self.run_btn.grid(row=r, column=0, sticky="ew", padx=12, pady=(6, 4))
         r += 1
 
-        self.progress = ttk.Progressbar(ctrl, mode="indeterminate", length=100)
+        self.progress = ttk.Progressbar(ctrl, mode="determinate", maximum=100, value=0, length=100)
         self.progress.grid(row=r, column=0, sticky="ew", padx=12, pady=(0, 4))
         r += 1
 
@@ -1182,10 +1184,22 @@ class SiftViz(tk.Tk):
                 kind = msg["kind"]
                 if kind == "status":
                     self._set_status(msg["text"], msg.get("error", False))
+                elif kind == "progress":
+                    n, total = msg["value"], msg["total"]
+                    if total > 0:
+                        pct = (n / total) * 100
+                        self.progress.config(mode="determinate", value=pct)
+                elif kind == "progress_indeterminate":
+                    self.progress.config(mode="indeterminate")
+                    self.progress.start(12)
                 elif kind == "pipeline_done":
                     self._on_pipeline_done(msg["projection"])
                 elif kind == "cluster_done":
                     self._on_cluster_done(msg["clusters"])
+                elif kind == "cancelled":
+                    self._running = False
+                    self._reset_run_button()
+                    self._set_status("Cancelled.")
                 elif kind == "error":
                     self._on_error(msg["text"])
         except queue.Empty:
@@ -1193,6 +1207,28 @@ class SiftViz(tk.Tk):
         self._poll_id = self.after(50, self._poll)
 
     # ── Pipeline ──────────────────────────────────────────────────────────────
+
+    def _reset_run_button(self) -> None:
+        """Restore the Run button to its normal (non-cancel) state."""
+        self.run_btn.config(
+            text="Run",
+            bg=ACCENT_COLOR,
+            activebackground="#3a8ee6",
+            command=self._on_run,
+            state="normal" if self.binary else "disabled",
+        )
+        self.progress.stop()
+        self.progress.config(mode="determinate", value=0)
+
+    def _on_cancel(self) -> None:
+        """Cancel the running pipeline by terminating the current subprocess."""
+        if not self._running:
+            return
+        log.info("cancelling pipeline")
+        self._cancel_requested = True
+        proc = self._current_proc
+        if proc is not None:
+            proc.terminate()
 
     def _on_run(self) -> None:
         """Validate inputs and start the hash → project pipeline in a daemon thread."""
@@ -1215,20 +1251,78 @@ class SiftViz(tk.Tk):
             dims,
         )
         self._running = True
+        self._cancel_requested = False
         self._projection_data = None
         self._cluster_data = None
-        self.run_btn.config(state="disabled")
-        self.progress.start(10)
+        self.run_btn.config(
+            text="Cancel",
+            bg="#c0392b",
+            activebackground="#a93226",
+            command=self._on_cancel,
+        )
+        self.progress.config(mode="determinate", value=0)
         self._clear_viewer()
         self._reset_axes()
         self.canvas.draw()
         threading.Thread(target=self._pipeline_thread, daemon=True).start()
 
+    def _run_subprocess(
+        self,
+        cmd: list[str],
+        stage: str,
+        *,
+        stream_progress: bool = False,
+    ) -> tuple[int, str]:
+        """Run *cmd* in a subprocess, streaming stderr line by line.
+
+        Lines matching ``sift: progress N/TOTAL`` are turned into
+        ``{"kind": "progress"}`` queue messages rather than being logged.
+        All other non-empty lines are forwarded to the logger.
+
+        Args:
+            cmd: Full argument list for the subprocess.
+            stage: Short label used in log messages (e.g. ``"hash"``).
+            stream_progress: When ``True``, parse progress lines and emit
+                queue updates; otherwise log all stderr lines normally.
+
+        Returns:
+            ``(returncode, joined_stderr)`` tuple.
+        """
+        proc = subprocess.Popen(
+            cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True
+        )
+        self._current_proc = proc
+        stderr_lines: list[str] = []
+
+        for raw in proc.stderr:
+            if self._cancel_requested:
+                proc.terminate()
+                break
+            line = raw.strip()
+            if not line:
+                continue
+            if stream_progress and line.startswith("sift: progress "):
+                try:
+                    frac = line.split()[-1]          # "N/TOTAL"
+                    n, total = map(int, frac.split("/"))
+                    self._q.put({"kind": "progress", "value": n, "total": total})
+                except Exception:
+                    pass
+            else:
+                _log_stderr(line, stage)
+            stderr_lines.append(line)
+
+        proc.wait()
+        if self._current_proc is proc:
+            self._current_proc = None
+        return proc.returncode, "\n".join(stderr_lines)
+
     def _pipeline_thread(self) -> None:
         """Background thread: run ``sift hash`` then ``sift project``.
 
-        Puts ``pipeline_done`` or ``error`` messages onto ``_q`` when done.
-        Each sift subprocess's stderr is forwarded to the logger line-by-line.
+        Uses ``_run_subprocess`` so stderr is streamed line by line; progress
+        lines from hashing are turned into bar updates.  Puts ``pipeline_done``,
+        ``cancelled``, or ``error`` onto ``_q`` when finished.
         """
         try:
             folder = self.folder_var.get().strip()
@@ -1239,46 +1333,50 @@ class SiftViz(tk.Tk):
             proj_m = self.proj_var.get()
             dims = int(self.dims_var.get())
 
-            # Hash
+            # ── Hash ──────────────────────────────────────────────────────────
             media_label = {"images": "images", "videos": "videos", "all": "images+videos"}[media]
             self._q.put({"kind": "status", "text": f"Hashing {media_label} with {algo} {size}×{size}…"})
             hash_cmd = [
-                self.binary,
-                "hash",
-                folder,
-                f"--algo={algo}",
-                f"--size={size}",
-                f"--media={media}",
-                f"--output={self._hashes_json}",
+                self.binary, "hash", folder,
+                f"--algo={algo}", f"--size={size}",
+                f"--media={media}", f"--output={self._hashes_json}",
             ]
             if media in ("videos", "all"):
                 hash_cmd.append(f"--frames={frames}")
-            r = subprocess.run(hash_cmd, capture_output=True, text=True)
-            if r.returncode != 0:
-                raise RuntimeError(r.stderr.strip() or "sift hash failed")
-            _log_stderr(r.stderr, "hash")
 
-            # Project
-            self._q.put(
-                {"kind": "status", "text": f"Running {proj_m.upper()} projection ({dims}D)…"}
-            )
-            cmd = [
-                self.binary,
-                "project",
-                self._hashes_json,
-                f"--method={proj_m}",
-                f"--dims={dims}",
+            rc, stderr = self._run_subprocess(hash_cmd, "hash", stream_progress=True)
+
+            if self._cancel_requested:
+                self._q.put({"kind": "cancelled"})
+                return
+            if rc != 0:
+                raise RuntimeError(stderr.splitlines()[-1] if stderr else "sift hash failed")
+
+            # ── Project ───────────────────────────────────────────────────────
+            self._q.put({
+                "kind": "status",
+                "text": f"Running {proj_m.upper()} projection ({dims}D)…",
+            })
+            self._q.put({"kind": "progress_indeterminate"})
+
+            proj_cmd = [
+                self.binary, "project", self._hashes_json,
+                f"--method={proj_m}", f"--dims={dims}",
                 f"--output={self._proj_json}",
             ]
             if proj_m == "tsne":
-                cmd += [
+                proj_cmd += [
                     f"--perplexity={int(self.perplexity_var.get())}",
                     f"--iterations={int(self.iterations_var.get())}",
                 ]
-            r = subprocess.run(cmd, capture_output=True, text=True)
-            if r.returncode != 0:
-                raise RuntimeError(r.stderr.strip() or "sift project failed")
-            _log_stderr(r.stderr, "project")
+
+            rc, stderr = self._run_subprocess(proj_cmd, "project")
+
+            if self._cancel_requested:
+                self._q.put({"kind": "cancelled"})
+                return
+            if rc != 0:
+                raise RuntimeError(stderr.splitlines()[-1] if stderr else "sift project failed")
 
             with open(self._proj_json) as fh:
                 proj = json.load(fh)
@@ -1297,8 +1395,7 @@ class SiftViz(tk.Tk):
         self._running = False
         self._projection_data = projection
         n = len(projection["files"])
-        self.progress.stop()
-        self.run_btn.config(state="normal")
+        self._reset_run_button()
         pts = np.array(projection["points"])
         dims = pts.shape[1] if pts.ndim == 2 else 2
         method = projection.get("method", "?").upper()
@@ -1314,8 +1411,7 @@ class SiftViz(tk.Tk):
             msg: Human-readable error description.
         """
         self._running = False
-        self.progress.stop()
-        self.run_btn.config(state="normal")
+        self._reset_run_button()
         self._set_status(f"Error: {msg}", error=True)
 
     # ── Clustering ────────────────────────────────────────────────────────────
