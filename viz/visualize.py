@@ -2,12 +2,13 @@
 """sift viz — interactive visualization frontend for the sift CLI tool.
 
 Flow:
-  1. Select folder + hash algo + projection method → Run
-     → calls `sift hash` then `sift project` (fixed 2D canvas)
+  1. Select folder + hash algo + projection method + dimensions → Run
+     → calls `sift hash` then `sift project` (2D or 3D canvas)
   2. Adjust clustering algo + sliders → live re-cluster
-     → calls `sift cluster`, recolors points + redraws hull bubbles
-  3. Click a hull bubble → viewer shows all files in that cluster with ◀ ▶ nav
-     Click an ungrouped point → viewer shows that single file
+     → calls `sift cluster`, recolors points by group
+  3. Click any point → if it belongs to a group, open that group with ◀ ▶ nav;
+     otherwise show that single file. The current point is always highlighted.
+     (In 3D mode: drag to rotate, scroll to zoom)
 """
 
 from __future__ import annotations
@@ -33,20 +34,13 @@ from typing import Any
 import matplotlib
 
 matplotlib.use("TkAgg")
-import matplotlib.path as mpath
+import matplotlib.colors as mcolors
 import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.artist import Artist
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
-from matplotlib.patches import Polygon
+from mpl_toolkits.mplot3d import proj3d  # noqa: F401 (side-effects + used in _hit_test_3d)
 from PIL import Image, ImageTk
-
-try:
-    from scipy.spatial import ConvexHull
-
-    HAS_SCIPY = True
-except ImportError:
-    HAS_SCIPY = False
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 
@@ -91,7 +85,6 @@ IMAGE_EXTS: frozenset[str] = frozenset(
 )
 
 POINT_HIT_RADIUS_PX: int = 12
-HULL_EXPAND: float = 1.06
 
 BG_COLOR: str = "#1a1a1a"
 PANEL_BG: str = "#242424"
@@ -361,40 +354,6 @@ def fit_image(img: Image.Image, max_w: int, max_h: int) -> Image.Image:
     return img
 
 
-# ── Convex hull ───────────────────────────────────────────────────────────────
-
-
-def build_hull_verts(pts: np.ndarray) -> np.ndarray | None:
-    """Compute expanded convex hull vertices for a cluster's scatter points.
-
-    For fewer than 3 points (or when scipy is unavailable) an ellipse
-    approximation is returned instead.
-
-    Args:
-        pts: ``(N, 2)`` array of 2-D scatter coordinates.
-
-    Returns:
-        ``(M, 2)`` closed polygon vertices (first == last), or ``None`` if
-        fewer than 2 points are provided.
-    """
-    if len(pts) < 2:
-        return None
-    if len(pts) < 3 or not HAS_SCIPY:
-        cx, cy = pts.mean(axis=0)
-        rx = max(float(np.std(pts[:, 0])) * 2.5, 0.02)
-        ry = max(float(np.std(pts[:, 1])) * 2.5, 0.02)
-        angles = np.linspace(0, 2 * np.pi, 32)
-        return np.column_stack([cx + rx * np.cos(angles), cy + ry * np.sin(angles)])
-    try:
-        hull = ConvexHull(pts)
-        verts = pts[hull.vertices]
-        centroid = verts.mean(axis=0)
-        expanded = centroid + (verts - centroid) * HULL_EXPAND
-        return np.vstack([expanded, expanded[0]])
-    except Exception:
-        return None
-
-
 # ── State dataclasses ─────────────────────────────────────────────────────────
 
 
@@ -411,7 +370,7 @@ class ViewerState:
 
     files: list[str] = field(default_factory=list)
     index: int = 0
-    group_id: int | None = None  # None = single-point selection
+    group_id: int | None = None
 
     @property
     def current_path(self) -> str | None:
@@ -427,9 +386,6 @@ class ViewerState:
 @dataclass
 class SelectionState:
     """Tracks which scatter point or cluster hull is currently selected.
-
-    Exactly one of *point_idx* or *group_idx* is set at a time; the other
-    remains ``None``.
 
     Attributes:
         point_idx: Index into the projection point array for a single selection.
@@ -452,7 +408,7 @@ class SelectionState:
 
 
 def _log_stderr(stderr: str, prefix: str) -> None:
-    """Emit each non-empty line of *stderr* as an INFO log entry.
+    """Emit each non-empty, non-noise line of *stderr* as an INFO log entry.
 
     Args:
         stderr: Raw stderr text from a sift subprocess.
@@ -474,6 +430,11 @@ class SiftViz(tk.Tk):
     Arranges three resizable panels (controls | scatter plot | media viewer)
     inside a ``tk.PanedWindow``.  Background threads communicate back to the
     UI via a ``queue.Queue`` polled every 50 ms with ``after()``.
+
+    The scatter plot supports both 2D and 3D projection modes.  In 3D mode
+    matplotlib's built-in ``Axes3D`` provides free mouse-drag rotation and
+    scroll-to-zoom; click-to-select uses screen-space projection to find the
+    nearest point.
     """
 
     def __init__(self) -> None:
@@ -502,21 +463,21 @@ class SiftViz(tk.Tk):
         self._poll_id: str | None = None
 
         # Hit-test state rebuilt on every _redraw
-        self._point_positions: np.ndarray | None = None
+        self._point_positions: np.ndarray | None = None  # (N,2) or (N,3)
         self._point_files: list[str] = []
-        self._hull_paths: list[tuple[mpath.Path, int]] = []
-        self._hull_verts: list[tuple[np.ndarray, int, Any]] = []
+        self._point_group: dict[int, int] = {}  # point_idx → group_idx
         self._overlay_artists: list[Artist] = []
 
         self._viewer = ViewerState()
         self._selection = SelectionState()
-        self._current_img: Image.Image | None = None  # kept for canvas resize re-render
+        self._current_img: Image.Image | None = None
 
         # tk vars
         self.folder_var = tk.StringVar()
         self.algo_var = tk.StringVar(value="dhash")
         self.hash_size_var = tk.IntVar(value=8)
         self.proj_var = tk.StringVar(value="pca")
+        self.dims_var = tk.StringVar(value="2")
         self.perplexity_var = tk.IntVar(value=30)
         self.iterations_var = tk.IntVar(value=1000)
         self.cluster_method_var = tk.StringVar(value="threshold")
@@ -550,6 +511,10 @@ class SiftViz(tk.Tk):
         shutil.rmtree(self.tmpdir, ignore_errors=True)
         self.destroy()
         sys.exit(0)
+
+    def _is_3d(self) -> bool:
+        """Return ``True`` when the 3D projection mode is selected."""
+        return self.dims_var.get() == "3"
 
     # ── UI construction ───────────────────────────────────────────────────────
 
@@ -624,7 +589,7 @@ class SiftViz(tk.Tk):
         )
         r += 1
 
-        # Projection
+        # Projection method
         self._section_label(ctrl, r, "PROJECTION")
         r += 1
         for proj, label in (("pca", "PCA"), ("tsne", "t-SNE")):
@@ -644,6 +609,27 @@ class SiftViz(tk.Tk):
         self.tsne_frame.columnconfigure(0, weight=1)
         self._labeled_slider(self.tsne_frame, 0, "Perplexity", self.perplexity_var, 5, 100)
         self._labeled_slider(self.tsne_frame, 2, "Iterations", self.iterations_var, 250, 3000)
+
+        # Dimensions toggle  (2D / 3D)
+        self._section_label(ctrl, r, "DIMENSIONS")
+        r += 1
+        dims_row = tk.Frame(ctrl, bg=PANEL_BG)
+        dims_row.grid(row=r, column=0, sticky="w", padx=12, pady=(0, 4))
+        r += 1
+        for label, value in (("2D", "2"), ("3D", "3")):
+            tk.Radiobutton(
+                dims_row,
+                text=label,
+                variable=self.dims_var,
+                value=value,
+                bg=PANEL_BG,
+                fg=TEXT_COLOR,
+                selectcolor=PANEL_BG,
+                activebackground=PANEL_BG,
+                activeforeground=TEXT_COLOR,
+                font=("", 9),
+                command=self._on_dims_change,
+            ).pack(side="left", padx=(0, 12))
 
         self._divider(ctrl, r)
         r += 1
@@ -726,9 +712,10 @@ class SiftViz(tk.Tk):
         pf.columnconfigure(0, weight=1)
         pf.rowconfigure(0, weight=1)
 
-        self.fig, self.ax = plt.subplots(figsize=(7, 6))
+        self.fig = plt.figure(figsize=(7, 6))
         self.fig.patch.set_facecolor(BG_COLOR)
-        self._reset_axes()
+        self.ax = self.fig.add_subplot(111)  # replaced by _rebuild_axes on first run
+        self._style_axes_2d()
 
         self.canvas = FigureCanvasTkAgg(self.fig, master=pf)
         self.canvas.get_tk_widget().grid(row=0, column=0, sticky="nsew")
@@ -740,14 +727,11 @@ class SiftViz(tk.Tk):
     def _build_viewer_panel(self, v: tk.Frame) -> None:
         """Build the right-hand media viewer with image canvas and action buttons.
 
-        The canvas row (row 1) is configured with ``weight=1`` so the image
-        area fills all available vertical space.
-
         Args:
             v: The parent ``tk.Frame`` for the viewer panel.
         """
         v.columnconfigure(0, weight=1)
-        v.rowconfigure(1, weight=1)  # canvas row expands
+        v.rowconfigure(1, weight=1)
 
         self._section_label(v, 0, "MEDIA VIEWER")
 
@@ -763,7 +747,6 @@ class SiftViz(tk.Tk):
             v, 5, text="Click a point or cluster\nto preview media", fg="#444"
         )
 
-        # Navigation
         nav = tk.Frame(v, bg=PANEL_BG)
         nav.grid(row=6, column=0, pady=(10, 0))
         self.prev_btn = self._icon_btn(nav, "◀", self._viewer_prev, col=0)
@@ -775,7 +758,6 @@ class SiftViz(tk.Tk):
         for b in (self.prev_btn, self.next_btn):
             b.config(state="disabled")
 
-        # Actions
         act = tk.Frame(v, bg=PANEL_BG)
         act.grid(row=7, column=0, pady=(8, 0))
         self.play_btn = self._action_btn(act, "▶  Play", self._play_media, col=0)
@@ -875,7 +857,7 @@ class SiftViz(tk.Tk):
         """Create, grid, and return a small icon/navigation button.
 
         Args:
-            parent: Container widget (expected to be a nav row frame).
+            parent: Container widget.
             text: Button symbol (e.g. ``"◀"``).
             command: Click callback.
             col: Grid column index within *parent*.
@@ -905,7 +887,7 @@ class SiftViz(tk.Tk):
         """Create, grid, and return a viewer action button (Play / Open / Folder).
 
         Args:
-            parent: Container widget (action row frame).
+            parent: Container widget.
             text: Button label.
             command: Click callback.
             col: Grid column index within *parent*.
@@ -988,7 +970,7 @@ class SiftViz(tk.Tk):
                 label; defaults to ``str``.
 
         Returns:
-            The value ``tk.Label`` widget (useful for storing a reference).
+            The value ``tk.Label`` widget.
         """
         f = tk.Frame(parent, bg=PANEL_BG)
         f.grid(row=row, column=0, sticky="ew", padx=12, pady=(2, 8))
@@ -1038,8 +1020,6 @@ class SiftViz(tk.Tk):
     ) -> None:
         """Add a text label followed by a slider on the next row.
 
-        Used inside the t-SNE options frame.
-
         Args:
             parent: Container widget.
             row: Grid row for the label; slider goes on ``row + 1``.
@@ -1058,8 +1038,6 @@ class SiftViz(tk.Tk):
         self, parent: tk.Widget, row: int, label: str, var: tk.IntVar, lo: int, hi: int
     ) -> None:
         """Add a labelled slider that triggers ``_on_slider`` on every change.
-
-        Convenience wrapper used when building the dynamic cluster params frame.
 
         Args:
             parent: Container widget.
@@ -1087,6 +1065,12 @@ class SiftViz(tk.Tk):
             self.tsne_frame.grid()
         else:
             self.tsne_frame.grid_remove()
+
+    def _on_dims_change(self) -> None:
+        """Notify the user that a dimension change requires a re-run."""
+        if self._projection_data:
+            dims = self.dims_var.get()
+            self._set_status(f"Dimension changed to {dims}D — click Run to apply.")
 
     def _on_method_change(self) -> None:
         """Rebuild the cluster parameter widgets and schedule a re-cluster."""
@@ -1145,8 +1129,7 @@ class SiftViz(tk.Tk):
     def _poll(self) -> None:
         """Drain the inter-thread queue and dispatch UI updates.
 
-        Rescheduled every 50 ms via ``after()``.  The poll ID is stored in
-        ``_poll_id`` so it can be cancelled on window close.
+        Rescheduled every 50 ms via ``after()``.
         """
         try:
             while True:
@@ -1178,11 +1161,13 @@ class SiftViz(tk.Tk):
             self._set_status("sift binary not found.", error=True)
             return
 
+        dims = self.dims_var.get()
         log.info(
-            "starting pipeline — folder=%s  algo=%s  proj=%s",
+            "starting pipeline — folder=%s  algo=%s  proj=%s  dims=%sD",
             folder,
             self.algo_var.get(),
             self.proj_var.get(),
+            dims,
         )
         self._running = True
         self._projection_data = None
@@ -1198,14 +1183,14 @@ class SiftViz(tk.Tk):
         """Background thread: run ``sift hash`` then ``sift project``.
 
         Puts ``pipeline_done`` or ``error`` messages onto ``_q`` when done.
-        Each sift subprocess's stderr is forwarded to the logger line-by-line
-        so progress and timing appear in the terminal.
+        Each sift subprocess's stderr is forwarded to the logger line-by-line.
         """
         try:
             folder = self.folder_var.get().strip()
             algo = self.algo_var.get()
             size = int(self.hash_size_var.get())
             proj_m = self.proj_var.get()
+            dims = int(self.dims_var.get())
 
             # Hash
             self._q.put({"kind": "status", "text": f"Hashing with {algo} {size}×{size}…"})
@@ -1226,13 +1211,15 @@ class SiftViz(tk.Tk):
             _log_stderr(r.stderr, "hash")
 
             # Project
-            self._q.put({"kind": "status", "text": f"Running {proj_m.upper()} projection…"})
+            self._q.put(
+                {"kind": "status", "text": f"Running {proj_m.upper()} projection ({dims}D)…"}
+            )
             cmd = [
                 self.binary,
                 "project",
                 self._hashes_json,
                 f"--method={proj_m}",
-                "--dims=2",
+                f"--dims={dims}",
                 f"--output={self._proj_json}",
             ]
             if proj_m == "tsne":
@@ -1264,8 +1251,10 @@ class SiftViz(tk.Tk):
         n = len(projection["files"])
         self.progress.stop()
         self.run_btn.config(state="normal")
+        pts = np.array(projection["points"])
+        dims = pts.shape[1] if pts.ndim == 2 else 2
         method = projection.get("method", "?").upper()
-        msg = f"{method} done — {n} images. Adjust clustering below."
+        msg = f"{method} done — {n} images ({dims}D). Adjust clustering below."
         log.info(msg)
         self._set_status(msg)
         self._run_cluster()
@@ -1349,11 +1338,24 @@ class SiftViz(tk.Tk):
         self._set_status(msg)
         self._redraw()
 
-    # ── Drawing ───────────────────────────────────────────────────────────────
+    # ── Axes management ───────────────────────────────────────────────────────
 
-    def _reset_axes(self) -> None:
-        """Clear the axes and apply the idle/placeholder style."""
-        self.ax.cla()
+    def _rebuild_axes(self) -> None:
+        """Clear the figure and recreate ``self.ax`` for the current dimension mode.
+
+        In 3D mode the axes gains built-in mouse-drag rotation and scroll-zoom
+        provided by ``Axes3D`` at no extra cost.
+        """
+        self.fig.clear()
+        if self._is_3d():
+            self.ax = self.fig.add_subplot(111, projection="3d")
+            self._style_axes_3d()
+        else:
+            self.ax = self.fig.add_subplot(111)
+            self._style_axes_2d()
+
+    def _style_axes_2d(self) -> None:
+        """Apply the dark idle style to a 2D axes."""
         self.ax.set_facecolor(BG_COLOR)
         self.ax.set_title("Run the pipeline to begin", color=DIM_COLOR, fontsize=11)
         self.ax.tick_params(colors=DIM_COLOR)
@@ -1361,11 +1363,28 @@ class SiftViz(tk.Tk):
             spine.set_color("#333")
         self.fig.tight_layout()
 
-    def _redraw(self) -> None:
-        """Replot all scatter points and hull polygons from current data.
+    def _style_axes_3d(self) -> None:
+        """Apply the dark idle style to a 3D axes."""
+        self.ax.set_facecolor(BG_COLOR)
+        for pane in (self.ax.xaxis.pane, self.ax.yaxis.pane, self.ax.zaxis.pane):
+            pane.fill = False
+            pane.set_edgecolor("#2e2e2e")
+        self.ax.tick_params(colors=DIM_COLOR, labelsize=7)
+        self.ax.set_title("Run the pipeline to begin", color=DIM_COLOR, fontsize=11)
+        self.fig.tight_layout()
 
-        Rebuilds ``_hull_paths`` and ``_hull_verts`` for hit-testing, then
-        calls ``_apply_selection_overlay`` to restore any active selection.
+    def _reset_axes(self) -> None:
+        """Rebuild axes and render the idle placeholder state."""
+        self._rebuild_axes()
+
+    # ── Drawing ───────────────────────────────────────────────────────────────
+
+    def _redraw(self) -> None:
+        """Replot all scatter points coloured by cluster membership.
+
+        No boundary shapes are drawn — cluster membership is conveyed purely
+        through point colour.  Calls ``_apply_selection_overlay`` at the end to
+        restore any active selection ring.
         """
         if not self._projection_data:
             return
@@ -1374,56 +1393,40 @@ class SiftViz(tk.Tk):
         files = proj["files"]
         pts = np.array(proj["points"])
         n = len(files)
+        is_3d = self._is_3d() and pts.ndim == 2 and pts.shape[1] == 3
 
+        # Assign per-point colours and build point→group reverse mapping
         colors: list[Any] = [UNGROUPED_COLOR] * n
-        membership: dict[int, list[int]] = {}
+        self._point_group = {}
+        n_groups = 0
 
         if self._cluster_data:
             groups = self._cluster_data.get("groups", [])
-            palette = cluster_palette(len(groups))
+            n_groups = len(groups)
+            palette = cluster_palette(n_groups)
             for gi, group in enumerate(groups):
                 for idx in group["members"]:
                     if 0 <= idx < n:
                         colors[idx] = palette[gi]
-                        membership.setdefault(gi, []).append(idx)
+                        self._point_group[idx] = gi
 
-        self.ax.cla()
-        self.ax.set_facecolor(BG_COLOR)
+        self._rebuild_axes()
 
-        self._hull_paths = []
-        self._hull_verts = []
-        if self._cluster_data:
-            groups = self._cluster_data.get("groups", [])
-            palette = cluster_palette(len(groups))  # same palette, O(1) per call
-            for gi, indices in membership.items():
-                color = palette[gi]
-                verts = build_hull_verts(pts[indices])
-                if verts is not None:
-                    self._hull_paths.append((mpath.Path(verts), gi))
-                    self._hull_verts.append((verts, gi, color))
-                    self.ax.add_patch(
-                        Polygon(
-                            verts,
-                            closed=True,
-                            facecolor=color,
-                            alpha=0.10,
-                            edgecolor=color,
-                            linewidth=1.2,
-                            linestyle="--",
-                            zorder=1,
-                        )
-                    )
+        # Normalise to a uniform RGBA array (Axes3D fails on mixed str/tuple lists)
+        c_rgba = mcolors.to_rgba_array(colors)
 
-        self.ax.scatter(
-            pts[:, 0],
-            pts[:, 1],
-            c=colors,
-            s=36,
-            linewidths=0.4,
-            edgecolors="white",
-            alpha=0.92,
-            zorder=3,
-        )
+        if is_3d:
+            self.ax.scatter(
+                pts[:, 0], pts[:, 1], pts[:, 2],
+                c=c_rgba, s=36, linewidths=0.4,
+                edgecolors="white", alpha=0.92, depthshade=True,
+            )
+        else:
+            self.ax.scatter(
+                pts[:, 0], pts[:, 1],
+                c=c_rgba, s=36, linewidths=0.4,
+                edgecolors="white", alpha=0.92, zorder=3,
+            )
 
         self._point_positions = pts
         self._point_files = files
@@ -1433,23 +1436,29 @@ class SiftViz(tk.Tk):
             ve = proj.get("variance_explained", [])
             xl = f"PC1  ({ve[0] * 100:.1f}%)" if ve else "PC1"
             yl = f"PC2  ({ve[1] * 100:.1f}%)" if len(ve) > 1 else "PC2"
+            zl = f"PC3  ({ve[2] * 100:.1f}%)" if len(ve) > 2 else "PC3"
         else:
-            xl, yl = "t-SNE 1", "t-SNE 2"
+            xl, yl, zl = "t-SNE 1", "t-SNE 2", "t-SNE 3"
 
         self.ax.set_xlabel(xl, color=DIM_COLOR, fontsize=9)
         self.ax.set_ylabel(yl, color=DIM_COLOR, fontsize=9)
-        self.ax.tick_params(colors="#555", labelsize=8)
-        for spine in self.ax.spines.values():
-            spine.set_color("#2e2e2e")
+        if is_3d:
+            self.ax.set_zlabel(zl, color=DIM_COLOR, fontsize=9)
+            for pane in (self.ax.xaxis.pane, self.ax.yaxis.pane, self.ax.zaxis.pane):
+                pane.fill = False
+                pane.set_edgecolor("#2e2e2e")
+            self.ax.tick_params(colors="#555", labelsize=7)
+        else:
+            self.ax.tick_params(colors="#555", labelsize=8)
+            for spine in self.ax.spines.values():
+                spine.set_color("#2e2e2e")
 
-        n_groups = len(membership)
+        dim_label = "3D" if is_3d else "2D"
         self.ax.set_title(
-            f"{n} images — {n_groups} cluster{'s' if n_groups != 1 else ''}"
+            f"{n} images — {n_groups} cluster{'s' if n_groups != 1 else ''}  [{dim_label}]"
             if self._cluster_data
-            else f"{n} images",
-            color=TEXT_COLOR,
-            fontsize=11,
-            pad=10,
+            else f"{n} images  [{dim_label}]",
+            color=TEXT_COLOR, fontsize=11, pad=10,
         )
         self.fig.tight_layout()
         self._overlay_artists = []
@@ -1458,11 +1467,11 @@ class SiftViz(tk.Tk):
     # ── Selection overlay ─────────────────────────────────────────────────────
 
     def _apply_selection_overlay(self) -> None:
-        """Remove stale overlay artists and draw fresh ones for the current selection.
+        """Remove stale overlay artists and draw a ring on the currently viewed point.
 
-        For a group selection: brightens the hull polygon and draws a ring on
-        the currently viewed member point.
-        For a single-point selection: draws a ring on that point only.
+        In 3D mode the axis limits are saved and restored around the draw so
+        that adding the ring scatter does not trigger autoscale and move the
+        camera.
         """
         for a in self._overlay_artists:
             try:
@@ -1477,60 +1486,66 @@ class SiftViz(tk.Tk):
             return
 
         sel = self._selection
+
+        pt_idx: int | None = None
         if sel.group_idx is not None:
-            # Solid white hull border + brighter fill for the selected group
-            for verts, gi, color in self._hull_verts:
-                if gi == sel.group_idx:
-                    poly = Polygon(
-                        verts,
-                        closed=True,
-                        facecolor=color,
-                        alpha=0.22,
-                        edgecolor="white",
-                        linewidth=2.0,
-                        linestyle="-",
-                        zorder=2,
-                    )
-                    self.ax.add_patch(poly)
-                    self._overlay_artists.append(poly)
-                    break
-            # Ring on the currently viewed member
             if sel.member_indices and 0 <= self._viewer.index < len(sel.member_indices):
                 pt_idx = sel.member_indices[self._viewer.index]
-                if 0 <= pt_idx < len(pts):
-                    self._draw_selection_ring(pts[pt_idx])
+        elif sel.point_idx is not None:
+            pt_idx = sel.point_idx
 
-        elif sel.point_idx is not None and 0 <= sel.point_idx < len(pts):
-            self._draw_selection_ring(pts[sel.point_idx])
+        # Snapshot 3D view state before adding any artists — new scatter calls
+        # trigger autoscale_view() which would reset zoom/pan.
+        is_3d = pts.ndim == 2 and pts.shape[1] == 3
+        if is_3d:
+            xlim = self.ax.get_xlim3d()
+            ylim = self.ax.get_ylim3d()
+            zlim = self.ax.get_zlim3d()
+
+        if pt_idx is not None and 0 <= pt_idx < len(pts):
+            self._draw_selection_ring(pts[pt_idx])
+
+        if is_3d:
+            self.ax.set_xlim3d(xlim)
+            self.ax.set_ylim3d(ylim)
+            self.ax.set_zlim3d(zlim)
 
         self.canvas.draw()
 
     def _draw_selection_ring(self, xy: np.ndarray) -> None:
-        """Draw a white ring + accent dot at scatter coordinate *xy*.
+        """Draw a white ring + accent dot at the given scatter coordinate.
 
-        The ring and dot are added to ``_overlay_artists`` so they can be
-        removed on the next selection change without a full redraw.
+        Works in both 2D (x, y) and 3D (x, y, z) based on the shape of *xy*.
 
         Args:
-            xy: 2-element array of data-space coordinates.
+            xy: 2- or 3-element array of data-space coordinates.
         """
-        x, y = float(xy[0]), float(xy[1])
-        outer = self.ax.scatter(
-            [x], [y], s=220, c="none", edgecolors="white", linewidths=2.5, zorder=7
-        )
-        inner = self.ax.scatter(
-            [x], [y], s=70, c=[ACCENT_COLOR], edgecolors="none", alpha=0.9, zorder=8
-        )
+        if len(xy) == 3:
+            x, y, z = float(xy[0]), float(xy[1]), float(xy[2])
+            outer = self.ax.scatter(
+                [x], [y], [z], s=220, c="none", edgecolors="white", linewidths=2.5
+            )
+            inner = self.ax.scatter(
+                [x], [y], [z], s=70, c=[ACCENT_COLOR], edgecolors="none", alpha=0.9
+            )
+        else:
+            x, y = float(xy[0]), float(xy[1])
+            outer = self.ax.scatter(
+                [x], [y], s=220, c="none", edgecolors="white", linewidths=2.5, zorder=7
+            )
+            inner = self.ax.scatter(
+                [x], [y], s=70, c=[ACCENT_COLOR], edgecolors="none", alpha=0.9, zorder=8
+            )
         self._overlay_artists.extend([outer, inner])
 
     # ── Click detection ───────────────────────────────────────────────────────
 
     def _on_mpl_click(self, event: Any) -> None:
-        """Handle a matplotlib mouse click: hull bubbles take priority over points.
+        """Handle a matplotlib mouse click in both 2D and 3D modes.
 
-        If the click lands inside a hull polygon ``_show_group`` is called.
-        Otherwise the nearest scatter point within ``POINT_HIT_RADIUS_PX``
-        pixels is selected via ``_show_single``.
+        In 2D: hull bubbles take priority over points (contains_point test).
+        In 3D: nearest-point only via screen-space projection (hull contains_point
+        is not reliable in 3D display space).
 
         Args:
             event: Matplotlib ``MouseEvent`` from the canvas.
@@ -1538,20 +1553,67 @@ class SiftViz(tk.Tk):
         if event.inaxes is not self.ax or self._point_positions is None:
             return
 
+        pts = self._point_positions
+        is_3d = pts.ndim == 2 and pts.shape[1] == 3
+
+        if is_3d:
+            self._hit_test_3d(event, pts)
+        else:
+            self._hit_test_2d(event, pts)
+
+    def _select_nearest(self, nearest: int) -> None:
+        """Select the nearest point, opening its group starting at that point.
+
+        Args:
+            nearest: Index of the closest scatter point to the click.
+        """
+        gi = self._point_group.get(nearest)
+        if gi is not None:
+            self._show_group(gi, start_point=nearest)
+        else:
+            self._show_single(nearest)
+
+    def _hit_test_2d(self, event: Any, pts: np.ndarray) -> None:
+        """2D click: find nearest scatter point in pixel space and select it.
+
+        Args:
+            event: Matplotlib mouse event.
+            pts: ``(N, 2)`` point positions in data space.
+        """
         click_pt = np.array([event.xdata, event.ydata])
         click_disp = self.ax.transData.transform(click_pt.reshape(1, 2))[0]
-        pts_disp = self.ax.transData.transform(self._point_positions)
+        pts_disp = self.ax.transData.transform(pts)
         dists = np.linalg.norm(pts_disp - click_disp, axis=1)
-
-        # Bubbles take priority over individual points
-        for hull_path, gi in self._hull_paths:
-            if hull_path.contains_point(click_pt):
-                self._show_group(gi)
-                return
-
         nearest = int(np.argmin(dists))
         if dists[nearest] <= POINT_HIT_RADIUS_PX:
-            self._show_single(nearest)
+            self._select_nearest(nearest)
+
+    def _hit_test_3d(self, event: Any, pts: np.ndarray) -> None:
+        """3D click: project all points to screen space, select nearest.
+
+        Uses ``mpl_toolkits.mplot3d.proj3d.proj_transform`` to obtain 2D
+        display coordinates for each point, then computes pixel distance from
+        the mouse click.
+
+        Args:
+            event: Matplotlib mouse event (``event.x`` / ``event.y`` are raw
+                canvas pixels in 3D mode).
+            pts: ``(N, 3)`` point positions in data space.
+        """
+        try:
+            proj_mat = self.ax.get_proj()
+            x2d, y2d, _ = proj3d.proj_transform(
+                pts[:, 0], pts[:, 1], pts[:, 2], proj_mat
+            )
+            pts_ax = np.column_stack([x2d, y2d])
+            pts_disp = self.ax.transData.transform(pts_ax)
+            click_disp = np.array([event.x, event.y])
+            dists = np.linalg.norm(pts_disp - click_disp, axis=1)
+            nearest = int(np.argmin(dists))
+            if dists[nearest] <= POINT_HIT_RADIUS_PX:
+                self._select_nearest(nearest)
+        except Exception as exc:
+            log.debug("3D hit test failed: %s", exc)
 
     # ── Viewer: selection ─────────────────────────────────────────────────────
 
@@ -1567,11 +1629,14 @@ class SiftViz(tk.Tk):
         self._update_viewer()
         self._apply_selection_overlay()
 
-    def _show_group(self, group_idx: int) -> None:
-        """Select a cluster group and load all its member files into the viewer.
+    def _show_group(self, group_idx: int, start_point: int | None = None) -> None:
+        """Select a cluster group, starting the viewer at the clicked point.
 
         Args:
             group_idx: Index into ``_cluster_data["groups"]``.
+            start_point: Point-array index of the clicked point; the viewer
+                opens at that position within the group so the user sees the
+                file they actually clicked, not always the first member.
         """
         if not self._cluster_data:
             return
@@ -1579,12 +1644,15 @@ class SiftViz(tk.Tk):
         if group_idx >= len(groups):
             return
         members = groups[group_idx]["members"]
-        files = [self._point_files[i] for i in members if 0 <= i < len(self._point_files)]
+        valid_members = [i for i in members if 0 <= i < len(self._point_files)]
+        files = [self._point_files[i] for i in valid_members]
         if not files:
             return
-        valid_members = [i for i in members if 0 <= i < len(self._point_files)]
-        log.debug("selected group %d (%d files)", group_idx, len(files))
-        self._viewer = ViewerState(files=files, group_id=group_idx)
+        initial_index = 0
+        if start_point is not None and start_point in valid_members:
+            initial_index = valid_members.index(start_point)
+        log.debug("selected group %d (%d files), starting at member %d", group_idx, len(files), initial_index)
+        self._viewer = ViewerState(files=files, index=initial_index, group_id=group_idx)
         self._selection = SelectionState(group_idx=group_idx, member_indices=valid_members)
         self._update_viewer()
         self._apply_selection_overlay()
@@ -1635,17 +1703,14 @@ class SiftViz(tk.Tk):
     ) -> None:
         """Apply a loaded image to the canvas (called on the main thread via ``after``).
 
-        Silently discards the result if the viewer has navigated to a different
-        file while the background load was in flight.
-
         Args:
             img: Decoded ``PIL.Image``, or ``None`` if loading failed.
-            path: The file path that was loaded (used for staleness check).
+            path: The file path that was loaded (staleness check).
             type_line: First info line (e.g. ``"IMAGE · PNG"``).
             meta: Second info line (dimensions, size, duration).
         """
         if not self._viewer.files or self._viewer.current_path != path:
-            return  # navigated away before load finished
+            return
 
         self.viewer_type_lbl.config(text=type_line)
         self.viewer_meta_lbl.config(text=meta)
@@ -1659,10 +1724,9 @@ class SiftViz(tk.Tk):
         ch = self.img_canvas.winfo_height()
 
         if cw <= 1 or ch <= 1:
-            return  # not yet mapped
+            return
 
         if self._current_img is None:
-            # Contextual placeholder for unloadable files
             path = self._viewer.current_path
             ext = Path(path).suffix.lower() if path else ""
             if ext in VIDEO_EXTS:
@@ -1682,7 +1746,7 @@ class SiftViz(tk.Tk):
         fitted = fit_image(self._current_img.copy(), cw - pad, ch - pad)
         iw, ih = fitted.size
         photo = ImageTk.PhotoImage(fitted)
-        self._thumb_ref = photo  # prevent GC
+        self._thumb_ref = photo
         self.img_canvas.create_image((cw - iw) // 2, (ch - ih) // 2, anchor="nw", image=photo)
 
     def _on_canvas_resize(self, _: Any = None) -> None:
