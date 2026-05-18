@@ -1,234 +1,213 @@
 # SIFT
 
-> *Named after the SIFT algorithm (Scale-Invariant Feature Transform) — a landmark in computer vision for detecting and describing local image features. An homage to the field.*
+> *An homage to SIFT (Scale-Invariant Feature Transform) — a landmark algorithm in computer vision.*
 
-SIFT is a high-performance image and video processing tool — built in the spirit of [FFmpeg](https://ffmpeg.org/) and its creator [Fabrice Bellard](https://bellard.org/). Bellard's work on FFmpeg redefined what a small, focused, open-source multimedia tool could be: zero-compromise performance, minimal dependencies, and a CLI that does everything. That philosophy lives here.
+SIFT is a tool for finding visual similarity across a collection of images and videos. Point it at a folder, and it figures out which files look alike, groups them together, and lets you explore those groups interactively in a visual interface.
 
-The domain is perceptual hashing and visual similarity — given a collection of images or videos, compress each file's visual identity into a compact hash, measure how visually similar files are to each other, cluster them by proximity, and surface the structure of your media library. Think of it as `ffmpeg` for understanding what's *in* your media, not just what format it's in.
-
----
-
-# SIFT C++ Rewrite
-
-> **Language**: C++17, Linux-first (macOS/Windows later)
-> **Build system**: CMake
-> **License**: MIT (open source from day one)
-> **Philosophy**: fast, minimal, CLI-first. Bellard-inspired — small tools that do one thing absurdly well.
+It's built in the spirit of FFmpeg — a focused, fast, command-line tool that does one thing well and composes cleanly with other tools.
 
 ---
 
-## Vision
+## What it does
 
-A high-performance perceptual hashing and clustering engine for visual media.
-Given a directory of images (or videos), compress each file's visual identity into
-a hash vector, measure pairwise similarity, cluster by proximity, and optionally
-visualize the hash space interactively.
+Given a folder of images and/or videos, SIFT:
 
-**Scope**: images and video. Not arbitrary files — perceptual hashing exploits
-spatial/visual structure that non-visual files don't have.
+1. **Compresses each file's visual identity into a tiny fingerprint** (called a perceptual hash) — a sequence of bits that captures what the file *looks like*, not its exact pixel values
+2. **Measures how visually similar every pair of files is** to each other using the difference between their fingerprints
+3. **Groups files that look similar** into clusters using your choice of algorithm
+4. **Projects the entire collection onto a 2D or 3D map** so you can see the structure of your media library at a glance
+5. **Lets you explore the map interactively** — click any point to preview that file, browse groups, and play videos inline
 
-**Architecture**: the CLI does everything (hashing, clustering, grouping, file
-operations). The GUI is a lightweight visualization addon — not a replacement.
-
----
-
-## Core Concepts
-
-### Perceptual Hashing as Dimensional Compression
-
-A perceptual hash compresses the visual identity of a media file into a fixed-size
-binary vector (e.g., 16x16 = 256 bits). This vector is a point in N-dimensional
-binary space. Unlike cryptographic hashes (where any change = totally different
-output), perceptual hashes preserve proximity — similar inputs map to nearby points.
-
-This is what makes the entire pipeline possible:
-- **Comparison** = Hamming distance between two points
-- **Clustering** = finding dense regions in that space
-- **Visualization** = projecting that space down to 2D/3D
-
-### Hash Algorithms
-
-| Algorithm | Technique | Strengths | Cost |
-|-----------|-----------|-----------|------|
-| **dHash** | Pixel gradient comparison | Fast, near-identical duplicates | Minimal |
-| **pHash** | DCT (Discrete Cosine Transform) | Robust to compression, resize, color shift | Moderate |
-| **wHash** | Haar wavelet transform | Texture/edge sensitive | Moderate |
-
-All three will be implemented from scratch in C++. The interface is uniform —
-swap the algorithm, keep the same pipeline.
-
-### Video Hashing Strategies
-
-Three approaches, in order of implementation priority:
-
-**Option A — Averaged frame hashes** (implement first)
-- Sample N evenly-spaced frames from the video
-- Hash each frame independently
-- Combine via majority voting per bit to produce a single hash
-- Simple, fast, works well for visually consistent videos
-- Limitation: loses temporal info, averages away scene changes
-
-**Option B — Frame hash set** (implement second, as a flag)
-- Sample N frames, hash each, keep the full set as the video's identity
-- Compare videos by comparing hash sets (min pairwise distance, % matching frames)
-- Preserves scene variation, detects partial overlap between videos
-- Tradeoff: more storage, O(N*M) comparison per video pair
-
-**Option C — Scene-level hashing** (stretch goal)
-- Detect scene boundaries (large frame-to-frame hash jumps)
-- Hash each scene segment separately
-- Semantically meaningful — captures the actual structure of the video
-- Most complex, scene detection is its own sub-problem
+The key insight: two files that look similar have fingerprints that are numerically close. This turns "visual similarity" into a math problem that computers can solve quickly.
 
 ---
 
-## Phased Roadmap
+## How the fingerprinting works
 
-### Phase 1 — Core Hashing Engine
+A perceptual hash is not like a password hash (where any tiny change produces a completely different output). Instead it's designed so that *similar inputs produce similar outputs*. Resize an image, re-compress it, adjust the brightness — the hash barely changes. Put a completely different image in — the hash is very different.
 
-**Goal**: CLI tool that takes an input directory and outputs computed hashes.
+SIFT supports three fingerprinting algorithms, each sensitive to different visual properties:
 
-- [ ] Project scaffolding: CMake build system, directory structure, CI
-- [ ] Image loading (via `stb_image` — single-header, zero-dep)
-- [ ] Implement dHash from scratch
-- [ ] Implement pHash from scratch (DCT computation)
-- [ ] Implement wHash from scratch (Haar wavelet transform)
-- [ ] Multi-threaded hashing via thread pool
-- [ ] Output format: JSON mapping file paths to hash vectors
-- [ ] CLI interface: `mhc hash <dir> --algo=phash --size=16`
-- [ ] Benchmarks vs the Python implementation
+| Algorithm | What it captures | Best for |
+|---|---|---|
+| **dHash** | Edge structure and gradients — where brightness changes across the image | Structural duplicates, same composition different colour |
+| **pHash** | Low-frequency patterns via DCT (the same math JPEG uses internally) | Near-duplicates across compression, scaling, minor edits |
+| **wHash** | Multi-scale texture and structure via wavelet transform | Distinguishing images with similar layout but different textures |
 
-**Key dependencies**:
-- `stb_image` — image decoding (single header, public domain)
-- Standard C++17 threading (`std::thread`, `std::mutex`, atomics)
-
-**No external math libraries** — DCT and Haar wavelet are straightforward
-enough to implement directly. Small, focused implementations > pulling in FFTW
-for a 16x16 transform.
+For videos, SIFT extracts N evenly-spaced frames, hashes each one, then combines them into a single fingerprint via majority vote (each bit is set if more than half the frames agree on it).
 
 ---
 
-### Phase 2 — Distance Computation & Clustering
+## How the clustering works
 
-**Goal**: take computed hashes, cluster them, output groups.
+Once every file has a fingerprint, SIFT computes the similarity between every pair. Three clustering algorithms are available:
 
-- [ ] Hamming distance computation (SIMD-optimized with `__builtin_popcountll`)
-- [ ] Pairwise distance matrix (parallel computation for large sets)
-- [ ] Clustering algorithms:
-  - [ ] Threshold-based grouping (simple: group if distance < T)
-  - [ ] Hierarchical agglomerative clustering
-  - [ ] DBSCAN / HDBSCAN (density-based, no hard threshold needed)
-- [ ] CLI interface: `mhc cluster --method=threshold --threshold=0.07`
-- [ ] File operations: `mhc sort <dir>` (hash + cluster + move files into group folders)
-- [ ] Hash caching: save computed hashes to disk, skip re-hashing unchanged files
-- [ ] Dry-run mode
-
-**Design note**: the distance matrix is O(n^2) in memory. For very large datasets
-(100k+ files), consider approximate nearest neighbor (ANN) approaches or chunked
-computation. But optimize later — O(n^2) is fine for the initial target of <50k files.
+- **Threshold** — group any two files whose fingerprints differ by less than N bits. Simple and fast, good starting point
+- **Hierarchical** — builds a tree of merges from most-similar pairs outward, then cuts the tree at a chosen height. Good for understanding the nested structure of your collection
+- **HDBSCAN** — a density-based algorithm that finds clusters of arbitrary shape without requiring you to specify how many there are. Best overall quality, handles noise well
 
 ---
 
-### Phase 3 — Visualization
+## How the visualization works
 
-**Goal**: interactive 2D/3D visualization of the hash space with live parameter tuning.
+Fingerprints are high-dimensional (64–1024 bits). To draw them on a screen, SIFT projects them down to 2D or 3D using:
 
-#### Phase 3a — Python Visualization (first pass)
-- [ ] Python script that reads the JSON hash output
-- [ ] Dimensionality reduction: PCA (fast), t-SNE, UMAP
-- [ ] Interactive scatter plot (Plotly or matplotlib)
-- [ ] Points colored by cluster, click to see filename/thumbnail
-- [ ] Slider controls: similarity threshold, clustering parameters
-- [ ] Live re-clustering on slider change
-- [ ] CLI integration: `mhc viz` launches the Python visualizer
+- **PCA** — fast, preserves global structure. Points that are far apart in the plot are genuinely dissimilar. Can look like a line or star when most files are very similar (this is correct — it means your collection has one dominant axis of variation)
+- **t-SNE** — slower, preserves local structure. Clusters pull apart cleanly even when PCA shows everything on one axis. Distances *between* clusters are not meaningful, but cluster membership is
 
-#### Phase 3b — Native Visualization (later)
-- [ ] Lightweight C++ GUI (Dear ImGui + SDL2 or similar)
-- [ ] Real-time rendering of hash space
-- [ ] Same interactive controls, but native performance
-- [ ] Thumbnail previews of media on hover/click
-- [ ] This replaces the Python visualizer as the default
-
-**Visualization philosophy**: this is the least interesting part architecturally.
-Keep it lightweight, minimal, and beautiful. The CLI is the real tool — the viz
-is a window into the hash space, nothing more.
+Both are computed upfront when you click Run — switching between 2D and 3D is instant.
 
 ---
 
-### Phase 4 — Polish & Extend
+## Requirements
 
-- [ ] Video support (Option A first, then Option B as `--video-mode=average|set`)
-- [ ] Video frame extraction (via FFmpeg libraries or minimal decoder)
-- [ ] Scene-level hashing (Option C) as experimental feature
-- [ ] Python bindings via pybind11 (use the C++ engine as a Python library)
-- [ ] macOS support
-- [ ] Windows support
-- [ ] Package distribution (Homebrew, AUR, apt, pip for bindings)
-- [ ] Export results to HTML report (cluster viz + thumbnails + metadata)
-- [ ] Audio perceptual hashing (spectral fingerprinting — natural extension)
-- [ ] Benchmarks and comparisons with existing tools
-- [ ] Comprehensive documentation and examples
+**To build the CLI:**
+- C++17 compiler (GCC or Clang)
+- CMake 3.20+
+- Ninja (optional but faster)
+
+**To run the visualizer:**
+- Python 3.13+
+- [uv](https://github.com/astral-sh/uv) (Python package manager)
+- ffmpeg + ffprobe (for video support and inline playback)
 
 ---
 
-## Project Structure (Proposed)
+## Building
+
+```bash
+# First time only — configure the build
+make configure
+
+# Build the sift binary
+make build
+```
+
+The binary is written to `build/sift`.
+
+---
+
+## Running
+
+### Hash a folder of images
+
+```bash
+make run ARGS="hash ./my-photos --algo=phash --output=hashes.json"
+```
+
+Options:
+- `--algo=dhash|phash|whash` — fingerprinting algorithm (default: dhash)
+- `--size=N` — hash grid size N×N, so N²  bits (default: 8, range: 2–32)
+- `--media=images|videos|all` — what to include (default: images)
+- `--frames=N` — frames to sample per video (default: 8)
+- `--threads=N` — parallel workers (default: all CPU cores)
+- `--output=file` — write JSON to file instead of stdout
+
+### Cluster the hashes
+
+```bash
+make run ARGS="cluster hashes.json --method=hdbscan --output=clusters.json"
+```
+
+Options:
+- `--method=threshold|hierarchical|hdbscan` (default: threshold)
+- `--threshold=N` — max bit difference to group (threshold method, default: 10)
+- `--linkage=single|complete|average` — merge strategy (hierarchical, default: complete)
+- `--cut-height=N` — where to cut the merge tree (hierarchical, default: 10)
+- `--min-group=N` — minimum cluster size (hdbscan, default: 3)
+- `--min-filter=N` — hide groups smaller than N in output (default: 2)
+
+### Project to 2D/3D
+
+```bash
+make run ARGS="project hashes.json --method=pca --dims=3 --output=projection.json"
+```
+
+### Pipe commands together
+
+```bash
+./build/sift hash ./photos --algo=phash | ./build/sift cluster - --method=hdbscan
+```
+
+---
+
+## Interactive visualizer
+
+```bash
+make viz
+```
+
+This opens the visual interface. From left to right:
+
+**Left panel — controls**
+- Choose your folder, hash algorithm, hash size, and whether to include images, videos, or both
+- Choose the projection method (PCA or t-SNE) and clustering algorithm
+- Click **Run** to start — hashing is the slow step, everything else is near-instant
+- Adjust clustering sliders live without re-running
+- Toggle between 2D and 3D view at the bottom (no re-run needed)
+
+**Centre panel — the map**
+- Each dot is a file. Colour indicates cluster membership — same colour means the algorithm grouped them together
+- Grey dots are ungrouped (no close neighbours found)
+- Click any dot to select it and preview it in the right panel
+- In 3D mode: drag to rotate, scroll to zoom
+
+**Right panel — media viewer**
+- Shows a thumbnail (or video frame) of the selected file
+- If the file belongs to a group, use ◀ ▶ to browse all members
+- **Play** — plays video files inline in the panel (requires ffmpeg)
+- **Open** — opens the file in your system's default application
+- **Folder** — reveals the file in your file manager
+
+---
+
+## Project structure
 
 ```
+sift/
 ├── CMakeLists.txt
-├── README.md
-├── PLAN.md
-├── LICENSE
-├── include/
-│   ├── hash/
-│   │   ├── dhash.h
-│   │   ├── phash.h
-│   │   └── whash.h
-│   ├── cluster/
-│   │   ├── distance.h
-│   │   ├── threshold.h
-│   │   ├── hierarchical.h
-│   │   └── dbscan.h
-│   ├── io/
-│   │   ├── image_loader.h
-│   │   ├── video_loader.h
-│   │   └── cache.h
-│   ├── core/
-│   │   ├── threadpool.h
-│   │   └── types.h
-│   └── cli/
-│       └── cli.h
+├── Makefile                  # convenience wrapper
 ├── src/
-│   ├── main.cpp
+│   ├── main.cpp              # CLI: subcommands hash / cluster / project
 │   ├── hash/
+│   │   ├── hash.hpp          # HashResult type + dHash / pHash / wHash
+│   │   ├── dHash.cpp
+│   │   ├── pHash.cpp
+│   │   ├── wHash.cpp
+│   │   ├── image.cpp         # image loading via stb_image
+│   │   ├── video_hash.hpp    # hash_video() — majority-vote across frames
+│   │   └── video_hash.cpp
 │   ├── cluster/
+│   │   ├── cluster.hpp       # GroupInfo, DistanceMatrix types
+│   │   ├── distance.cpp      # pairwise Hamming distance matrix
+│   │   ├── thresh.cpp        # threshold clustering
+│   │   ├── hierarchical.cpp  # agglomerative clustering
+│   │   └── hdbscan.cpp       # HDBSCAN
 │   ├── io/
-│   ├── core/
-│   └── cli/
-├── tests/
-├── bench/
-├── viz/                  # Python visualization (Phase 3a)
-│   ├── visualize.py
-│   └── requirements.txt
-└── third_party/
-    └── stb_image.h
+│   │   ├── io.hpp            # scan_images / scan_videos / scan_media
+│   │   ├── scanner.cpp
+│   │   ├── frame_source.hpp  # FrameSource abstraction for video frames
+│   │   ├── frame_source.cpp  # EvenlySpacedSource implementation
+│   │   ├── json_parse.cpp    # parse hash JSON back to ClusterInput
+│   │   └── writer.cpp
+│   ├── project/
+│   │   ├── project.hpp       # ProjectionResult type
+│   │   ├── pca.cpp           # PCA projection
+│   │   └── tsne.cpp          # t-SNE projection
+│   └── core/
+│       └── threadpool.hpp    # work-stealing thread pool
+├── third_party/
+│   └── stb_image.h           # single-header image decoder
+└── viz/
+    ├── visualize.py          # full interactive visualizer (~1900 lines)
+    └── pyproject.toml        # uv-managed dependencies
 ```
 
 ---
 
-## Design Principles
+## Design philosophy
 
-1. **CLI does everything** — the GUI is optional. Every operation is scriptable.
-2. **Uniform hash interface** — swap algorithms without changing the pipeline.
-3. **Speed over generality** — optimize for images/video, don't try to hash everything.
-4. **Minimal dependencies** — prefer single-header libraries or writing it yourself.
-5. **Progressive complexity** — threshold clustering works out of the box, advanced methods are opt-in.
-6. **Composable** — hash output is JSON, can be piped to other tools or consumed by the viz layer.
-
----
-
-## Open Questions
-
-- [ ] Hash output format: JSON (human-readable) vs binary (faster I/O for large datasets)? Maybe both.
-- [ ] Should the viz layer communicate with the CLI via files, pipes, or sockets?
-- [ ] SIMD strategy: SSE4.2 baseline? AVX2 optional? Runtime detection?
-- [ ] How to handle hash size configurability at compile time vs runtime (templates vs runtime polymorphism)
+- **CLI does everything** — every operation is scriptable, the visualizer is optional
+- **Composable** — hash output is plain JSON, pipe it to other tools or load it elsewhere
+- **Fast** — hashing is parallel across all CPU cores; clustering and projection are near-instant for typical library sizes
+- **Minimal dependencies** — image decoding via a single-header library; no external math frameworks; ffmpeg used as a subprocess rather than a linked library
