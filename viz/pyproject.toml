@@ -6,8 +6,17 @@ requires-python = ">=3.13"
 dependencies = [
     "matplotlib>=3.10.9",
     "numpy>=2.4.5",
+    "ruff>=0.15.13",
     "scipy>=1.17.1",
 ]
 
 [project.scripts]
 sift-viz = "visualize:main"
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP"]
+ignore = ["E501"]  # line length handled by formatter, not linter
