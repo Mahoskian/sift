@@ -12,11 +12,13 @@ add_executable(sift
   src/hash/pHash.cpp
   src/hash/wHash.cpp
   src/hash/image.cpp
+  src/hash/video_hash.cpp
   src/cluster/distance.cpp
   src/cluster/thresh.cpp
   src/cluster/hierarchical.cpp
   src/cluster/hdbscan.cpp
   src/io/scanner.cpp
+  src/io/frame_source.cpp
   src/io/json_parse.cpp
   src/io/writer.cpp
   src/project/pca.cpp

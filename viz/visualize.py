@@ -476,6 +476,8 @@ class SiftViz(tk.Tk):
         self.folder_var = tk.StringVar()
         self.algo_var = tk.StringVar(value="dhash")
         self.hash_size_var = tk.IntVar(value=8)
+        self.media_var = tk.StringVar(value="images")
+        self.frames_var = tk.IntVar(value=8)
         self.proj_var = tk.StringVar(value="pca")
         self.dims_var = tk.StringVar(value="2")
         self.perplexity_var = tk.IntVar(value=30)
@@ -489,6 +491,7 @@ class SiftViz(tk.Tk):
 
         self._build_ui()
         self._update_tsne_visibility()
+        self._update_frames_visibility()
         self._rebuild_cluster_params()
         self._poll()
 
@@ -588,6 +591,37 @@ class SiftViz(tk.Tk):
             label_fn=lambda v: f"{v}×{v} · {v * v} bits",
         )
         r += 1
+
+        # Media type
+        self._section_label(ctrl, r, "MEDIA TYPE")
+        r += 1
+        for value, label in (("images", "Images only"), ("videos", "Videos only"), ("all", "Both")):
+            tk.Radiobutton(
+                ctrl,
+                text=label,
+                variable=self.media_var,
+                value=value,
+                bg=PANEL_BG,
+                fg=TEXT_COLOR,
+                selectcolor=PANEL_BG,
+                activebackground=PANEL_BG,
+                activeforeground=TEXT_COLOR,
+                font=("", 9),
+                anchor="w",
+                command=self._on_media_type_change,
+            ).grid(row=r, column=0, sticky="w", padx=12)
+            r += 1
+
+        self.frames_frame = tk.Frame(ctrl, bg=PANEL_BG)
+        self.frames_frame.grid(row=r, column=0, sticky="ew")
+        r += 1
+        self.frames_frame.columnconfigure(0, weight=1)
+        tk.Label(
+            self.frames_frame, text="Frames per video", bg=PANEL_BG, fg=DIM_COLOR, font=("", 8)
+        ).grid(row=0, column=0, sticky="w", padx=12, pady=(4, 0))
+        self._slider(self.frames_frame, 1, self.frames_var, 1, 32,
+                     label_fn=lambda v: f"{v} frame{'s' if v != 1 else ''}")
+        self._update_frames_visibility()
 
         # Projection method
         self._section_label(ctrl, r, "PROJECTION")
@@ -1066,6 +1100,17 @@ class SiftViz(tk.Tk):
         else:
             self.tsne_frame.grid_remove()
 
+    def _update_frames_visibility(self) -> None:
+        """Show or hide the frames-per-video slider based on the media type selection."""
+        if self.media_var.get() in ("videos", "all"):
+            self.frames_frame.grid()
+        else:
+            self.frames_frame.grid_remove()
+
+    def _on_media_type_change(self) -> None:
+        """Update frames slider visibility when the media type selection changes."""
+        self._update_frames_visibility()
+
     def _on_dims_change(self) -> None:
         """Notify the user that a dimension change requires a re-run."""
         if self._projection_data:
@@ -1189,23 +1234,26 @@ class SiftViz(tk.Tk):
             folder = self.folder_var.get().strip()
             algo = self.algo_var.get()
             size = int(self.hash_size_var.get())
+            media = self.media_var.get()
+            frames = int(self.frames_var.get())
             proj_m = self.proj_var.get()
             dims = int(self.dims_var.get())
 
             # Hash
-            self._q.put({"kind": "status", "text": f"Hashing with {algo} {size}×{size}…"})
-            r = subprocess.run(
-                [
-                    self.binary,
-                    "hash",
-                    folder,
-                    f"--algo={algo}",
-                    f"--size={size}",
-                    f"--output={self._hashes_json}",
-                ],
-                capture_output=True,
-                text=True,
-            )
+            media_label = {"images": "images", "videos": "videos", "all": "images+videos"}[media]
+            self._q.put({"kind": "status", "text": f"Hashing {media_label} with {algo} {size}×{size}…"})
+            hash_cmd = [
+                self.binary,
+                "hash",
+                folder,
+                f"--algo={algo}",
+                f"--size={size}",
+                f"--media={media}",
+                f"--output={self._hashes_json}",
+            ]
+            if media in ("videos", "all"):
+                hash_cmd.append(f"--frames={frames}")
+            r = subprocess.run(hash_cmd, capture_output=True, text=True)
             if r.returncode != 0:
                 raise RuntimeError(r.stderr.strip() or "sift hash failed")
             _log_stderr(r.stderr, "hash")
@@ -1254,7 +1302,7 @@ class SiftViz(tk.Tk):
         pts = np.array(projection["points"])
         dims = pts.shape[1] if pts.ndim == 2 else 2
         method = projection.get("method", "?").upper()
-        msg = f"{method} done — {n} images ({dims}D). Adjust clustering below."
+        msg = f"{method} done — {n} files ({dims}D). Adjust clustering below."
         log.info(msg)
         self._set_status(msg)
         self._run_cluster()
@@ -1455,9 +1503,9 @@ class SiftViz(tk.Tk):
 
         dim_label = "3D" if is_3d else "2D"
         self.ax.set_title(
-            f"{n} images — {n_groups} cluster{'s' if n_groups != 1 else ''}  [{dim_label}]"
+            f"{n} files — {n_groups} cluster{'s' if n_groups != 1 else ''}  [{dim_label}]"
             if self._cluster_data
-            else f"{n} images  [{dim_label}]",
+            else f"{n} files  [{dim_label}]",
             color=TEXT_COLOR, fontsize=11, pad=10,
         )
         self.fig.tight_layout()

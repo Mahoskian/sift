@@ -1,6 +1,8 @@
 #include "hash.hpp"
+#include "video_hash.hpp"
 #include "cluster.hpp"
 #include "io.hpp"
+#include "frame_source.hpp"
 #include "project.hpp"
 #include "threadpool.hpp"
 
@@ -30,6 +32,9 @@ static void print_usage() {
         "  --size=<N>                       Hash grid size NxN (default: 8)\n"
         "  --threads=<N>                    Thread count (default: CPU cores)\n"
         "  --output=<file>                  Output JSON file (default: stdout)\n"
+        "  --media=<images|videos|all>      What to hash (default: images)\n"
+        "  --frames=<N>                     Frames to sample per video (default: 8)\n"
+        "  --strategy=<evenly_spaced>       Frame extraction strategy (default: evenly_spaced)\n"
         "\n"
         "Cluster options:\n"
         "  --method=<threshold|hierarchical|hdbscan>\n"
@@ -285,24 +290,33 @@ static int cmd_hash(int argc, char* argv[]) {
     int hash_size = 8;
     int num_threads = (int)std::thread::hardware_concurrency();
     std::string output_file;
+    std::string media_type = "images"; // images | videos | all
+    int n_frames = 8;
+    std::string strategy = "evenly_spaced";
 
     static struct option long_opts[] = {
-        {"algo",    required_argument, 0, 'a'},
-        {"size",    required_argument, 0, 's'},
-        {"threads", required_argument, 0, 't'},
-        {"output",  required_argument, 0, 'o'},
-        {"help",    no_argument,       0, 'h'},
+        {"algo",     required_argument, 0, 'a'},
+        {"size",     required_argument, 0, 's'},
+        {"threads",  required_argument, 0, 't'},
+        {"output",   required_argument, 0, 'o'},
+        {"media",    required_argument, 0, 'M'},
+        {"frames",   required_argument, 0, 'F'},
+        {"strategy", required_argument, 0, 'S'},
+        {"help",     no_argument,       0, 'h'},
         {0, 0, 0, 0}
     };
 
     optind = 1;
     int opt;
-    while ((opt = getopt_long(argc, argv, "a:s:t:o:h", long_opts, nullptr)) != -1) {
+    while ((opt = getopt_long(argc, argv, "a:s:t:o:M:F:S:h", long_opts, nullptr)) != -1) {
         switch (opt) {
             case 'a': algo = optarg; break;
             case 's': hash_size = std::stoi(optarg); break;
             case 't': num_threads = std::stoi(optarg); break;
             case 'o': output_file = optarg; break;
+            case 'M': media_type = optarg; break;
+            case 'F': n_frames = std::stoi(optarg); break;
+            case 'S': strategy = optarg; break;
             case 'h': print_usage(); return 0;
             default:  print_usage(); return 1;
         }
@@ -319,6 +333,11 @@ static int cmd_hash(int argc, char* argv[]) {
         return 1;
     }
     if (num_threads < 1) num_threads = 1;
+    if (n_frames < 1) n_frames = 1;
+    if (media_type != "images" && media_type != "videos" && media_type != "all") {
+        std::cerr << "sift: --media must be images, videos, or all\n";
+        return 1;
+    }
 
     HashFn hash_fn;
     if (algo == "dhash")      hash_fn = dhash;
@@ -329,23 +348,41 @@ static int cmd_hash(int argc, char* argv[]) {
         return 1;
     }
 
-    auto images = io::scan_images(input_dir);
-    if (images.empty()) {
-        std::cerr << "sift: no images found in " << input_dir << "\n";
+    // ── Scan for files ────────────────────────────────────────────────────────
+
+    std::vector<std::filesystem::path> images, videos;
+    if (media_type == "images" || media_type == "all")
+        images = io::scan_images(input_dir);
+    if (media_type == "videos" || media_type == "all")
+        videos = io::scan_videos(input_dir);
+
+    if (images.empty() && videos.empty()) {
+        std::cerr << "sift: no " << media_type << " found in " << input_dir << "\n";
         return 1;
     }
 
-    std::cerr << "sift: found " << images.size() << " images, hashing with "
-              << algo << " " << hash_size << "x" << hash_size
+    int total_files = (int)(images.size() + videos.size());
+    std::cerr << "sift: found " << images.size() << " image(s) + "
+              << videos.size() << " video(s)"
+              << ", hashing with " << algo << " " << hash_size << "x" << hash_size
               << " (" << (hash_size * hash_size) << " bits)"
-              << " using " << num_threads << " threads\n";
+              << " using " << num_threads << " threads";
+    if (!videos.empty())
+        std::cerr << " [video: " << n_frames << " frames via " << strategy << "]";
+    std::cerr << "\n";
 
     auto t_start = std::chrono::steady_clock::now();
 
-    std::vector<std::pair<std::string, HashResult>> results(images.size());
+    std::vector<std::pair<std::string, HashResult>> results(total_files);
+
+    // Build the frame source once; it is stateless and safe to share across threads.
+    auto frame_source = io::make_frame_source(strategy, n_frames);
+
     {
         ThreadPool pool(num_threads);
         std::vector<std::future<void>> futures;
+
+        // Hash images
         for (size_t i = 0; i < images.size(); i++) {
             futures.push_back(pool.submit([&, i]() {
                 std::string path_str = images[i].string();
@@ -353,12 +390,29 @@ static int cmd_hash(int argc, char* argv[]) {
                 results[i] = {path_str, std::move(h)};
             }));
         }
+
+        // Hash videos (majority-vote across frames)
+        size_t offset = images.size();
+        for (size_t i = 0; i < videos.size(); i++) {
+            futures.push_back(pool.submit([&, i, offset]() {
+                HashResult h = hash_video(videos[i], *frame_source, hash_fn, hash_size);
+                results[offset + i] = {videos[i].string(), std::move(h)};
+            }));
+        }
+
         for (auto& f : futures) f.get();
     }
 
+    // Drop any files where hashing failed (empty result).
+    results.erase(
+        std::remove_if(results.begin(), results.end(),
+                       [](const auto& p) { return p.second.bits.empty(); }),
+        results.end());
+
     auto t_end = std::chrono::steady_clock::now();
     double elapsed_ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
-    std::cerr << "sift: hashed " << images.size() << " images in " << elapsed_ms << " ms\n";
+    std::cerr << "sift: hashed " << results.size() << "/" << total_files
+              << " files in " << elapsed_ms << " ms\n";
 
     if (output_file.empty()) {
         write_hash_json(std::cout, algo, hash_size, results);
