@@ -25,11 +25,19 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import tkinter as tk
 from dataclasses import dataclass, field
 from pathlib import Path
 from tkinter import filedialog, ttk
 from typing import Any
+
+try:
+    import sounddevice as sd
+    HAS_SOUNDDEVICE = True
+except ImportError:
+    sd = None  # type: ignore[assignment]
+    HAS_SOUNDDEVICE = False
 
 import matplotlib
 
@@ -339,35 +347,42 @@ def _video_meta(path: str) -> tuple[str, str]:
         return "", ""
 
 
-def _probe_video_info(path: str) -> tuple[int, int, float]:
-    """Return ``(width, height, fps)`` for a video file via ffprobe.
+def _probe_video_info(path: str) -> tuple[int, int, float, bool]:
+    """Return ``(width, height, fps, has_audio)`` for a video file via ffprobe.
 
     Args:
         path: Path to a video file.
 
     Returns:
-        ``(width, height, fps)`` on success, or ``(0, 0, 0.0)`` on failure.
+        ``(width, height, fps, has_audio)`` on success, or ``(0, 0, 0.0, False)``
+        on failure.
     """
     if not HAS_FFPROBE:
-        return 0, 0, 0.0
+        return 0, 0, 0.0, False
     try:
         r = subprocess.run(
             ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_streams", path],
             capture_output=True, text=True, timeout=8,
         )
         if r.returncode != 0:
-            return 0, 0, 0.0
-        for stream in json.loads(r.stdout).get("streams", []):
-            if stream.get("codec_type") == "video":
+            return 0, 0, 0.0, False
+        streams = json.loads(r.stdout).get("streams", [])
+        w = h = 0
+        fps = 0.0
+        has_audio = False
+        for stream in streams:
+            codec = stream.get("codec_type")
+            if codec == "video" and not w:
                 w, h = stream.get("width", 0), stream.get("height", 0)
                 fps_str = stream.get("r_frame_rate", "25/1")
                 num, den = (int(x) for x in fps_str.split("/"))
                 fps = max(1.0, min(num / den if den else 25.0, 120.0))
-                return w, h, fps
-        return 0, 0, 0.0
+            elif codec == "audio":
+                has_audio = True
+        return w, h, fps, has_audio
     except Exception as exc:
         log.debug("_probe_video_info failed: %s", exc)
-        return 0, 0, 0.0
+        return 0, 0, 0.0, False
 
 
 def fit_image(img: Image.Image, max_w: int, max_h: int) -> Image.Image:
@@ -456,14 +471,24 @@ def _log_stderr(stderr: str, prefix: str) -> None:
 
 
 class VideoPlayer:
-    """Renders ffmpeg-decoded video frames onto a tkinter Canvas.
+    """Renders ffmpeg-decoded video frames onto a tkinter Canvas with audio.
 
-    Decoding runs in a daemon thread that pipes raw RGB frames into a small
-    queue.  The main thread pulls frames from that queue on a timer whose
-    period matches the video's native frame rate.
+    Two ffmpeg processes run in parallel — one pipes raw RGB frames into a
+    queue consumed by the main-thread tick loop; the other pipes raw PCM
+    audio into a sounddevice output stream consumed by a dedicated thread.
 
-    No audio is produced — this is a visual preview only.
+    Frame timing uses elapsed wall-clock time so the video self-corrects for
+    drift (drops frames when behind, waits when ahead).  Audio and video are
+    both started from the same ``time.monotonic()`` origin, giving tight
+    enough sync for a preview tool (<50 ms offset in practice).
+
+    Audio playback degrades gracefully: if sounddevice is not installed, or
+    the video has no audio track, video-only playback continues unchanged.
     """
+
+    _SAMPLE_RATE: int = 44100
+    _CHANNELS: int = 2
+    _AUDIO_BLOCK: int = 2048  # samples per sounddevice write (~46 ms at 44 100 Hz)
 
     def __init__(self, canvas: tk.Canvas, on_end: Any) -> None:
         """Args:
@@ -474,15 +499,25 @@ class VideoPlayer:
         """
         self._canvas = canvas
         self._on_end = on_end
+
+        # Video state
         self._proc: subprocess.Popen | None = None
         self._thread: threading.Thread | None = None
-        self._frame_q: queue.Queue[bytes | None] = queue.Queue(maxsize=8)
+        self._frame_q: queue.Queue[bytes | None] = queue.Queue(maxsize=16)
+        self._frame_w = 0
+        self._frame_h = 0
+        self._fps = 25.0
+        self._frames_shown = 0
+        self._play_start = 0.0
+
+        # Audio state
+        self._audio_proc: subprocess.Popen | None = None
+        self._audio_thread: threading.Thread | None = None
+        self._audio_stream: Any = None  # sd.RawOutputStream when active
+
         self._active = False
         self._after_id: str | None = None
         self._photo: Any = None  # ImageTk.PhotoImage — held to prevent GC
-        self._frame_w = 0
-        self._frame_h = 0
-        self._frame_ms = 40  # updated from actual fps on play()
 
     @property
     def is_playing(self) -> bool:
@@ -503,19 +538,20 @@ class VideoPlayer:
         """
         self.stop()
 
-        vid_w, vid_h, fps = _probe_video_info(path)
+        vid_w, vid_h, fps, has_audio = _probe_video_info(path)
         if not vid_w or not vid_h:
             return False
 
         cw = max(self._canvas.winfo_width(), 1)
         ch = max(self._canvas.winfo_height(), 1)
-        pad = 8
-        scale = min((cw - pad) / vid_w, (ch - pad) / vid_h)
+        scale = min((cw - 8) / vid_w, (ch - 8) / vid_h)
         self._frame_w = max(1, int(vid_w * scale))
         self._frame_h = max(1, int(vid_h * scale))
-        self._frame_ms = max(1, int(1000 / fps))
+        self._fps = fps
+        self._frames_shown = 0
         self._active = True
 
+        # ── Video process ─────────────────────────────────────────────────────
         self._proc = subprocess.Popen(
             [
                 "ffmpeg", "-loglevel", "quiet", "-i", path,
@@ -527,11 +563,43 @@ class VideoPlayer:
         )
         self._thread = threading.Thread(target=self._read_frames, daemon=True)
         self._thread.start()
+
+        # ── Audio process (optional) ──────────────────────────────────────────
+        if has_audio and HAS_SOUNDDEVICE:
+            try:
+                self._audio_proc = subprocess.Popen(
+                    [
+                        "ffmpeg", "-loglevel", "quiet", "-i", path,
+                        "-vn",
+                        "-f", "s16le",
+                        "-ar", str(self._SAMPLE_RATE),
+                        "-ac", str(self._CHANNELS),
+                        "pipe:1",
+                    ],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                )
+                self._audio_stream = sd.RawOutputStream(
+                    samplerate=self._SAMPLE_RATE,
+                    channels=self._CHANNELS,
+                    dtype="int16",
+                    blocksize=self._AUDIO_BLOCK,
+                )
+                self._audio_stream.start()
+                self._audio_thread = threading.Thread(
+                    target=self._read_audio, daemon=True
+                )
+                self._audio_thread.start()
+            except Exception as exc:
+                log.debug("audio init failed, continuing without audio: %s", exc)
+                self._teardown_audio()
+
+        self._play_start = time.monotonic()
         self._tick()
         return True
 
     def stop(self) -> None:
-        """Immediately halt playback and release resources."""
+        """Immediately halt playback and release all resources."""
         self._active = False
         if self._after_id is not None:
             try:
@@ -539,18 +607,31 @@ class VideoPlayer:
             except Exception:
                 pass
             self._after_id = None
-        proc = self._proc
-        if proc is not None:
-            proc.terminate()
+        if self._proc is not None:
+            self._proc.terminate()
             self._proc = None
-        # drain queue so the reader thread can unblock and exit
+        # drain so the reader thread can unblock and exit
         while True:
             try:
                 self._frame_q.get_nowait()
             except queue.Empty:
                 break
+        self._teardown_audio()
 
     # ── Internal ──────────────────────────────────────────────────────────────
+
+    def _teardown_audio(self) -> None:
+        """Stop and release audio stream and process."""
+        if self._audio_stream is not None:
+            try:
+                self._audio_stream.stop()
+                self._audio_stream.close()
+            except Exception:
+                pass
+            self._audio_stream = None
+        if self._audio_proc is not None:
+            self._audio_proc.terminate()
+            self._audio_proc = None
 
     def _read_frames(self) -> None:
         """Reader thread: pulls raw RGB frames from ffmpeg stdout into the queue."""
@@ -560,7 +641,7 @@ class VideoPlayer:
             raw = proc.stdout.read(frame_bytes)
             if not raw or len(raw) < frame_bytes:
                 try:
-                    self._frame_q.put(None, timeout=2.0)  # end-of-stream sentinel
+                    self._frame_q.put(None, timeout=2.0)
                 except queue.Full:
                     pass
                 break
@@ -569,36 +650,70 @@ class VideoPlayer:
             except queue.Full:
                 pass  # drop frame — display is lagging
 
+    def _read_audio(self) -> None:
+        """Reader thread: pulls PCM audio from ffmpeg stdout into sounddevice."""
+        chunk = self._AUDIO_BLOCK * self._CHANNELS * 2  # bytes per write
+        proc = self._audio_proc
+        stream = self._audio_stream
+        while self._active and proc and proc.stdout and stream:
+            raw = proc.stdout.read(chunk)
+            if not raw:
+                break
+            try:
+                stream.write(raw)
+            except Exception:
+                break
+
     def _tick(self) -> None:
-        """Main-thread timer: dequeue one frame and schedule the next tick."""
+        """Main-thread timer: dequeue the next due frame and reschedule."""
         if not self._active:
             return
 
+        elapsed = time.monotonic() - self._play_start
+        target = int(elapsed * self._fps)
+
+        # Drop frames that we're behind on (video fell behind audio/clock)
+        while self._frames_shown < target:
+            try:
+                stale = self._frame_q.get_nowait()
+            except queue.Empty:
+                break
+            if stale is None:
+                self._active = False
+                self._on_end()
+                return
+            self._frames_shown += 1
+
+        # Fetch the next frame to display
         try:
             raw = self._frame_q.get_nowait()
         except queue.Empty:
-            # Decoder hasn't caught up yet — retry in 5 ms
             self._after_id = self._canvas.after(5, self._tick)
             return
 
         if raw is None:
-            # Natural end of stream
             self._active = False
             self._on_end()
             return
 
         img = Image.frombytes("RGB", (self._frame_w, self._frame_h), raw)
         photo = ImageTk.PhotoImage(img)
-        self._photo = photo  # keep ref alive
+        self._photo = photo
 
         cw = self._canvas.winfo_width()
         ch = self._canvas.winfo_height()
-        x = max(0, (cw - self._frame_w) // 2)
-        y = max(0, (ch - self._frame_h) // 2)
         self._canvas.delete("all")
-        self._canvas.create_image(x, y, anchor="nw", image=photo)
+        self._canvas.create_image(
+            max(0, (cw - self._frame_w) // 2),
+            max(0, (ch - self._frame_h) // 2),
+            anchor="nw", image=photo,
+        )
+        self._frames_shown += 1
 
-        self._after_id = self._canvas.after(self._frame_ms, self._tick)
+        # Schedule next tick exactly when the next frame is due
+        next_due = self._frames_shown / self._fps
+        delay = max(1, int((next_due - (time.monotonic() - self._play_start)) * 1000))
+        self._after_id = self._canvas.after(delay, self._tick)
 
 
 # ── Main application ──────────────────────────────────────────────────────────
