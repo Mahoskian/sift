@@ -1,0 +1,5 @@
+when i play a media then pause it, i am unable to leaf thru the media, also the skip back or forwards buttons dont work, fix them and make sure
+its by 1 sec increments, the same goes for the scub bar, if the video is paused i can drag the bar but if its paused and i just click the bar it
+like exits, i want on the left side pane for the PROJECTION section to have its own section (it has a dividing bar from HASH ALGORITHM, Media Type
+will be moved to under the folder seclection entry (i want the buttons to be grouped nicely), finally i also want PROJECTION to have its own
+progress bar as its a distinct step that happens ONCE the hashing has finished, not during.

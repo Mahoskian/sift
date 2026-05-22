@@ -32,12 +32,6 @@ from pathlib import Path
 from tkinter import filedialog, ttk
 from typing import Any
 
-try:
-    import sounddevice as sd
-    HAS_SOUNDDEVICE = True
-except ImportError:
-    sd = None  # type: ignore[assignment]
-    HAS_SOUNDDEVICE = False
 
 import matplotlib
 
@@ -108,6 +102,7 @@ THUMB_H: int = 240
 # Resolved once at import time so every call to has_ffmpeg/has_ffprobe is O(1).
 HAS_FFMPEG: bool = shutil.which("ffmpeg") is not None
 HAS_FFPROBE: bool = shutil.which("ffprobe") is not None
+HAS_FFPLAY: bool = shutil.which("ffplay") is not None
 
 
 # ── Tool / binary detection ───────────────────────────────────────────────────
@@ -347,26 +342,31 @@ def _video_meta(path: str) -> tuple[str, str]:
         return "", ""
 
 
-def _probe_video_info(path: str) -> tuple[int, int, float, bool]:
-    """Return ``(width, height, fps, has_audio)`` for a video file via ffprobe.
+def _probe_video_info(path: str) -> tuple[int, int, float, bool, float]:
+    """Return ``(width, height, fps, has_audio, duration)`` for a video file via ffprobe.
 
     Args:
         path: Path to a video file.
 
     Returns:
-        ``(width, height, fps, has_audio)`` on success, or ``(0, 0, 0.0, False)``
-        on failure.
+        ``(width, height, fps, has_audio, duration)`` on success, or
+        ``(0, 0, 0.0, False, 0.0)`` on failure.
     """
     if not HAS_FFPROBE:
-        return 0, 0, 0.0, False
+        return 0, 0, 0.0, False, 0.0
     try:
         r = subprocess.run(
-            ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_streams", path],
+            [
+                "ffprobe", "-v", "quiet", "-print_format", "json",
+                "-show_streams", "-show_format", path,
+            ],
             capture_output=True, text=True, timeout=8,
         )
         if r.returncode != 0:
-            return 0, 0, 0.0, False
-        streams = json.loads(r.stdout).get("streams", [])
+            return 0, 0, 0.0, False, 0.0
+        data = json.loads(r.stdout)
+        streams = data.get("streams", [])
+        duration = float(data.get("format", {}).get("duration") or 0)
         w = h = 0
         fps = 0.0
         has_audio = False
@@ -379,10 +379,10 @@ def _probe_video_info(path: str) -> tuple[int, int, float, bool]:
                 fps = max(1.0, min(num / den if den else 25.0, 120.0))
             elif codec == "audio":
                 has_audio = True
-        return w, h, fps, has_audio
+        return w, h, fps, has_audio, duration
     except Exception as exc:
         log.debug("_probe_video_info failed: %s", exc)
-        return 0, 0, 0.0, False
+        return 0, 0, 0.0, False, 0.0
 
 
 def fit_image(img: Image.Image, max_w: int, max_h: int) -> Image.Image:
@@ -398,6 +398,19 @@ def fit_image(img: Image.Image, max_w: int, max_h: int) -> Image.Image:
     """
     img.thumbnail((max_w, max_h), Image.LANCZOS)
     return img
+
+
+def _fmt_duration(seconds: float) -> str:
+    """Format a duration in seconds as ``"M:SS"``.
+
+    Args:
+        seconds: Duration in seconds.
+
+    Returns:
+        Formatted string, e.g. ``"1:07"`` or ``"0:00"``.
+    """
+    s = int(max(0.0, seconds))
+    return f"{s // 60}:{s % 60:02d}"
 
 
 # ── State dataclasses ─────────────────────────────────────────────────────────
@@ -473,22 +486,20 @@ def _log_stderr(stderr: str, prefix: str) -> None:
 class VideoPlayer:
     """Renders ffmpeg-decoded video frames onto a tkinter Canvas with audio.
 
-    Two ffmpeg processes run in parallel — one pipes raw RGB frames into a
-    queue consumed by the main-thread tick loop; the other pipes raw PCM
-    audio into a sounddevice output stream consumed by a dedicated thread.
+    The video ffmpeg process pipes raw RGB frames into a queue consumed by
+    the main-thread tick loop.  Audio is played via a separate ``ffplay``
+    process which handles device output independently — this avoids the
+    ALSA/PortAudio crashes that come from driving a sounddevice stream from
+    within a Python thread.
 
     Frame timing uses elapsed wall-clock time so the video self-corrects for
-    drift (drops frames when behind, waits when ahead).  Audio and video are
-    both started from the same ``time.monotonic()`` origin, giving tight
-    enough sync for a preview tool (<50 ms offset in practice).
+    drift (drops frames when behind, waits when ahead).  A/V sync is wall-
+    clock based: both ffmpeg and ffplay are started from the same seek offset
+    at nearly the same instant, keeping them within ~50 ms in practice.
 
-    Audio playback degrades gracefully: if sounddevice is not installed, or
-    the video has no audio track, video-only playback continues unchanged.
+    Supports pause/resume (freezes at the current frame position, restarts
+    from there) and seek (restarts both processes from an arbitrary timestamp).
     """
-
-    _SAMPLE_RATE: int = 44100
-    _CHANNELS: int = 2
-    _AUDIO_BLOCK: int = 2048  # samples per sounddevice write (~46 ms at 44 100 Hz)
 
     def __init__(self, canvas: tk.Canvas, on_end: Any) -> None:
         """Args:
@@ -500,31 +511,61 @@ class VideoPlayer:
         self._canvas = canvas
         self._on_end = on_end
 
-        # Video state
-        self._proc: subprocess.Popen | None = None
-        self._thread: threading.Thread | None = None
-        self._frame_q: queue.Queue[bytes | None] = queue.Queue(maxsize=16)
+        # Persistent across seeks (set once on play())
+        self._path = ""
+        self._duration = 0.0
+        self._has_audio = False
         self._frame_w = 0
         self._frame_h = 0
         self._fps = 25.0
+        self._position_cb: Any = None  # callable(float) or None
+
+        # Per-segment state (reset on each _start_at call)
+        self._proc: subprocess.Popen | None = None
+        self._thread: threading.Thread | None = None
+        self._frame_q: queue.Queue[bytes | None] = queue.Queue(maxsize=16)
         self._frames_shown = 0
-        self._play_start = 0.0
+        self._seek_pos = 0.0      # start offset of current ffmpeg segment
+        self._play_start = 0.0   # monotonic time when this segment began
 
-        # Audio state
+        # Audio (optional ffplay subprocess)
         self._audio_proc: subprocess.Popen | None = None
-        self._audio_thread: threading.Thread | None = None
-        self._audio_stream: Any = None  # sd.RawOutputStream when active
 
-        self._active = False
+        # Playback state
+        self._active = False      # ffmpeg running and ticking
+        self._paused = False      # stopped at a known position, ready to resume
+        self._pause_pos = 0.0
+
         self._after_id: str | None = None
-        self._photo: Any = None  # ImageTk.PhotoImage — held to prevent GC
+        self._photo: Any = None   # ImageTk.PhotoImage — held to prevent GC
+
+    # ── Public API ────────────────────────────────────────────────────────────
 
     @property
     def is_playing(self) -> bool:
-        """``True`` while a video is actively playing."""
+        """``True`` while a video is actively playing (not paused)."""
         return self._active
 
-    def play(self, path: str) -> bool:
+    @property
+    def is_paused(self) -> bool:
+        """``True`` while playback is paused at a known position."""
+        return self._paused
+
+    @property
+    def position(self) -> float:
+        """Current playback position in seconds."""
+        if self._paused:
+            return self._pause_pos
+        if not self._active:
+            return 0.0
+        return self._seek_pos + (time.monotonic() - self._play_start)
+
+    @property
+    def duration(self) -> float:
+        """Total video duration in seconds (0.0 if unknown)."""
+        return self._duration
+
+    def play(self, path: str, seek: float = 0.0, position_cb: Any = None) -> bool:
         """Start playback of *path* on the canvas.
 
         Stops any in-progress playback first.  Returns ``False`` if the video
@@ -532,13 +573,16 @@ class VideoPlayer:
 
         Args:
             path: Absolute path to a video file.
+            seek: Start position in seconds (default 0).
+            position_cb: Optional callable ``(float)`` invoked each frame tick
+                with the current playback position in seconds.
 
         Returns:
             ``True`` if playback started, ``False`` on failure.
         """
         self.stop()
 
-        vid_w, vid_h, fps, has_audio = _probe_video_info(path)
+        vid_w, vid_h, fps, has_audio, duration = _probe_video_info(path)
         if not vid_w or not vid_h:
             return False
 
@@ -548,13 +592,83 @@ class VideoPlayer:
         self._frame_w = max(1, int(vid_w * scale))
         self._frame_h = max(1, int(vid_h * scale))
         self._fps = fps
+        self._path = path
+        self._duration = duration
+        self._has_audio = has_audio
+        self._position_cb = position_cb
+
+        self._start_at(seek)
+        return True
+
+    def pause(self) -> None:
+        """Pause playback at the current position."""
+        if not self._active:
+            return
+        self._pause_pos = self.position
+        self._active = False
+        self._paused = True
+        self._cancel_tick()
+        if self._proc is not None:
+            self._proc.terminate()
+            self._proc = None
+        self._drain_queue()
+        self._teardown_audio()
+
+    def resume(self) -> None:
+        """Resume playback from the paused position."""
+        if not self._paused:
+            return
+        self._paused = False
+        self._start_at(self._pause_pos)
+
+    def seek(self, t: float) -> None:
+        """Seek to *t* seconds and resume playback.
+
+        Works whether currently playing or paused.
+        """
+        if not self._path:
+            return
+        self._active = False
+        self._paused = False
+        self._cancel_tick()
+        if self._proc is not None:
+            self._proc.terminate()
+            self._proc = None
+        self._drain_queue()
+        self._teardown_audio()
+        self._start_at(t)
+
+    def stop(self) -> None:
+        """Immediately halt playback and release all resources."""
+        self._active = False
+        self._paused = False
+        self._cancel_tick()
+        if self._proc is not None:
+            self._proc.terminate()
+            self._proc = None
+        self._drain_queue()
+        self._teardown_audio()
+
+    # ── Internal ──────────────────────────────────────────────────────────────
+
+    def _start_at(self, t: float) -> None:
+        """Start (or restart) ffmpeg and ffplay from position *t* seconds."""
+        if self._duration > 0:
+            t = max(0.0, min(t, self._duration))
+        else:
+            t = max(0.0, t)
+        self._seek_pos = t
         self._frames_shown = 0
         self._active = True
+
+        seek_args = ["-ss", f"{t:.3f}"] if t > 0 else []
 
         # ── Video process ─────────────────────────────────────────────────────
         self._proc = subprocess.Popen(
             [
-                "ffmpeg", "-loglevel", "quiet", "-i", path,
+                "ffmpeg", "-loglevel", "quiet",
+                *seek_args,
+                "-i", self._path,
                 "-vf", f"scale={self._frame_w}:{self._frame_h}:flags=fast_bilinear",
                 "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1",
             ],
@@ -564,71 +678,44 @@ class VideoPlayer:
         self._thread = threading.Thread(target=self._read_frames, daemon=True)
         self._thread.start()
 
-        # ── Audio process (optional) ──────────────────────────────────────────
-        if has_audio and HAS_SOUNDDEVICE:
+        # ── Audio process via ffplay (no sounddevice / PortAudio involved) ────
+        if self._has_audio and HAS_FFPLAY:
             try:
                 self._audio_proc = subprocess.Popen(
                     [
-                        "ffmpeg", "-loglevel", "quiet", "-i", path,
-                        "-vn",
-                        "-f", "s16le",
-                        "-ar", str(self._SAMPLE_RATE),
-                        "-ac", str(self._CHANNELS),
-                        "pipe:1",
+                        "ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet",
+                        *seek_args,
+                        self._path,
                     ],
-                    stdout=subprocess.PIPE,
+                    stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
                 )
-                self._audio_stream = sd.RawOutputStream(
-                    samplerate=self._SAMPLE_RATE,
-                    channels=self._CHANNELS,
-                    dtype="int16",
-                    blocksize=self._AUDIO_BLOCK,
-                )
-                self._audio_stream.start()
-                self._audio_thread = threading.Thread(
-                    target=self._read_audio, daemon=True
-                )
-                self._audio_thread.start()
             except Exception as exc:
-                log.debug("audio init failed, continuing without audio: %s", exc)
-                self._teardown_audio()
+                log.debug("ffplay audio failed, continuing without audio: %s", exc)
+                self._audio_proc = None
 
         self._play_start = time.monotonic()
         self._tick()
-        return True
 
-    def stop(self) -> None:
-        """Immediately halt playback and release all resources."""
-        self._active = False
+    def _cancel_tick(self) -> None:
+        """Cancel any pending after() tick callback."""
         if self._after_id is not None:
             try:
                 self._canvas.after_cancel(self._after_id)
             except Exception:
                 pass
             self._after_id = None
-        if self._proc is not None:
-            self._proc.terminate()
-            self._proc = None
-        # drain so the reader thread can unblock and exit
+
+    def _drain_queue(self) -> None:
+        """Discard all pending frames so the reader thread can exit cleanly."""
         while True:
             try:
                 self._frame_q.get_nowait()
             except queue.Empty:
                 break
-        self._teardown_audio()
-
-    # ── Internal ──────────────────────────────────────────────────────────────
 
     def _teardown_audio(self) -> None:
-        """Stop and release audio stream and process."""
-        if self._audio_stream is not None:
-            try:
-                self._audio_stream.stop()
-                self._audio_stream.close()
-            except Exception:
-                pass
-            self._audio_stream = None
+        """Terminate the ffplay audio process if running."""
         if self._audio_proc is not None:
             self._audio_proc.terminate()
             self._audio_proc = None
@@ -650,20 +737,6 @@ class VideoPlayer:
             except queue.Full:
                 pass  # drop frame — display is lagging
 
-    def _read_audio(self) -> None:
-        """Reader thread: pulls PCM audio from ffmpeg stdout into sounddevice."""
-        chunk = self._AUDIO_BLOCK * self._CHANNELS * 2  # bytes per write
-        proc = self._audio_proc
-        stream = self._audio_stream
-        while self._active and proc and proc.stdout and stream:
-            raw = proc.stdout.read(chunk)
-            if not raw:
-                break
-            try:
-                stream.write(raw)
-            except Exception:
-                break
-
     def _tick(self) -> None:
         """Main-thread timer: dequeue the next due frame and reschedule."""
         if not self._active:
@@ -672,7 +745,7 @@ class VideoPlayer:
         elapsed = time.monotonic() - self._play_start
         target = int(elapsed * self._fps)
 
-        # Drop frames that we're behind on (video fell behind audio/clock)
+        # Drop frames that we're behind on (video fell behind clock)
         while self._frames_shown < target:
             try:
                 stale = self._frame_q.get_nowait()
@@ -709,6 +782,11 @@ class VideoPlayer:
             anchor="nw", image=photo,
         )
         self._frames_shown += 1
+
+        # Report position to the UI callback (main thread — safe to update widgets)
+        if self._position_cb is not None:
+            pos = self._seek_pos + self._frames_shown / self._fps
+            self._position_cb(pos)
 
         # Schedule next tick exactly when the next frame is due
         next_due = self._frames_shown / self._fps
@@ -810,8 +888,9 @@ class SiftViz(tk.Tk):
         log.info("shutting down")
         if self._poll_id is not None:
             self.after_cancel(self._poll_id)
-        if self._video_player and self._video_player.is_playing:
-            self._video_player.stop()
+        player = self._video_player
+        if player and (player.is_playing or player.is_paused):
+            player.stop()
         plt.close("all")
         shutil.rmtree(self.tmpdir, ignore_errors=True)
         self.destroy()
@@ -1078,6 +1157,13 @@ class SiftViz(tk.Tk):
     def _build_viewer_panel(self, v: tk.Frame) -> None:
         """Build the right-hand media viewer with image canvas and action buttons.
 
+        Layout (top → bottom):
+          - Media canvas (fills available height)
+          - File name / type / meta / cluster labels
+          - Seek bar with time labels (hidden when not playing/paused)
+          - Playback controls: ⏮ skip-back | ▶/⏸ play-pause | ⏭ skip-forward
+          - Navigation + actions: ◀ group | N/M | ↗ Open | ⌂ Folder | ▶ group
+
         Args:
             v: The parent ``tk.Frame`` for the viewer panel.
         """
@@ -1099,24 +1185,63 @@ class SiftViz(tk.Tk):
             v, 5, text="Click a point or cluster\nto preview media", fg="#444"
         )
 
-        nav = tk.Frame(v, bg=PANEL_BG)
-        nav.grid(row=6, column=0, pady=(10, 0))
-        self.prev_btn = self._icon_btn(nav, "◀", self._viewer_prev, col=0)
-        self.nav_lbl = tk.Label(nav, text="", bg=PANEL_BG, fg=DIM_COLOR, font=("", 9), width=8)
-        self.nav_lbl.grid(row=0, column=1)
-        self.next_btn = self._icon_btn(nav, "▶", self._viewer_next, col=2)
-        for b in (self.prev_btn, self.next_btn):
+        # ── Seek / scrub bar (shown only during video playback / pause) ───────
+        self.seek_frame = tk.Frame(v, bg=PANEL_BG)
+        self.seek_frame.columnconfigure(1, weight=1)
+        self.seek_frame.grid(row=6, column=0, sticky="ew", padx=12, pady=(6, 0))
+        self.seek_frame.grid_remove()  # hidden until playback starts
+
+        self.seek_pos_lbl = tk.Label(
+            self.seek_frame, text="0:00", bg=PANEL_BG, fg=DIM_COLOR, font=("", 7), width=5, anchor="w"
+        )
+        self.seek_pos_lbl.grid(row=0, column=0, sticky="w")
+
+        self.seek_var = tk.DoubleVar(value=0.0)
+        self.seek_scale = tk.Scale(
+            self.seek_frame,
+            from_=0.0,
+            to=100.0,
+            orient="horizontal",
+            variable=self.seek_var,
+            bg=PANEL_BG,
+            fg=TEXT_COLOR,
+            troughcolor="#333",
+            highlightthickness=0,
+            showvalue=False,
+            command=self._on_seek_drag,
+        )
+        self.seek_scale.grid(row=0, column=1, sticky="ew")
+        self.seek_dur_lbl = tk.Label(
+            self.seek_frame, text="0:00", bg=PANEL_BG, fg=DIM_COLOR, font=("", 7), width=5, anchor="e"
+        )
+        self.seek_dur_lbl.grid(row=0, column=2, sticky="e")
+
+        self._user_scrubbing = False
+        self.seek_scale.bind("<ButtonPress-1>", self._on_seek_press)
+        self.seek_scale.bind("<ButtonRelease-1>", self._on_seek_release)
+
+        # ── Playback controls ─────────────────────────────────────────────────
+        pb = tk.Frame(v, bg=PANEL_BG)
+        pb.grid(row=7, column=0, pady=(6, 0))
+        self.skip_back_btn = self._icon_btn(pb, "⏮", self._skip_back, col=0)
+        self.play_pause_btn = self._action_btn(pb, "▶  Play", self._toggle_play_pause, col=1)
+        self.skip_fwd_btn = self._icon_btn(pb, "⏭", self._skip_forward, col=2)
+        for b in (self.skip_back_btn, self.play_pause_btn, self.skip_fwd_btn):
             b.config(state="disabled")
 
+        # ── Group navigation + file actions (one row) ─────────────────────────
         act = tk.Frame(v, bg=PANEL_BG)
-        act.grid(row=7, column=0, pady=(8, 0))
-        self.play_btn = self._action_btn(act, "▶  Play", self._play_media, col=0)
-        self.open_btn = self._action_btn(act, "↗  Open", self._open_media, col=1)
-        self.folder_btn = self._action_btn(act, "⌂  Folder", self._open_in_folder, col=2)
-        for b in (self.play_btn, self.open_btn, self.folder_btn):
+        act.grid(row=8, column=0, pady=(8, 0))
+        self.prev_btn = self._icon_btn(act, "◀", self._viewer_prev, col=0)
+        self.nav_lbl = tk.Label(act, text="", bg=PANEL_BG, fg=DIM_COLOR, font=("", 8), width=5)
+        self.nav_lbl.grid(row=0, column=1, padx=2)
+        self.open_btn = self._action_btn(act, "↗  Open", self._open_media, col=2)
+        self.folder_btn = self._action_btn(act, "⌂  Folder", self._open_in_folder, col=3)
+        self.next_btn = self._icon_btn(act, "▶", self._viewer_next, col=4)
+        for b in (self.prev_btn, self.next_btn, self.open_btn, self.folder_btn):
             b.config(state="disabled")
 
-        self.viewer_path_lbl = self._viewer_label(v, 8, fg="#383838", font=("", 7), pady=(6, 12))
+        self.viewer_path_lbl = self._viewer_label(v, 9, fg="#383838", font=("", 7), pady=(6, 12))
 
     # ── Widget factory helpers ────────────────────────────────────────────────
 
@@ -2156,9 +2281,13 @@ class SiftViz(tk.Tk):
 
     def _update_viewer(self) -> None:
         """Refresh all viewer widgets (nav buttons, labels, image) for the current file."""
-        if self._video_player and self._video_player.is_playing:
-            self._video_player.stop()
-            self.play_btn.config(text="▶  Play", command=self._play_media)
+        player = self._video_player
+        if player and (player.is_playing or player.is_paused):
+            player.stop()
+            self.play_pause_btn.config(text="▶  Play")
+            self.seek_frame.grid_remove()
+            self.skip_back_btn.config(state="disabled")
+            self.skip_fwd_btn.config(state="disabled")
 
         v = self._viewer
         if not v.files:
@@ -2171,7 +2300,9 @@ class SiftViz(tk.Tk):
         self.next_btn.config(state="normal" if v.is_multi else "disabled")
         self.nav_lbl.config(text=f"{v.index + 1} / {len(v.files)}" if v.is_multi else "")
 
-        self.play_btn.config(state="normal" if is_video else "disabled")
+        self.play_pause_btn.config(state="normal" if is_video else "disabled")
+        self.skip_back_btn.config(state="disabled")
+        self.skip_fwd_btn.config(state="disabled")
         self.open_btn.config(state="normal")
         self.folder_btn.config(state="normal")
 
@@ -2265,8 +2396,10 @@ class SiftViz(tk.Tk):
 
     def _clear_viewer(self) -> None:
         """Reset the viewer panel to its empty/placeholder state."""
-        if self._video_player and self._video_player.is_playing:
-            self._video_player.stop()
+        player = self._video_player
+        if player and (player.is_playing or player.is_paused):
+            player.stop()
+        self.seek_frame.grid_remove()
         self._viewer = ViewerState()
         self._selection = SelectionState()
         self._thumb_ref = None
@@ -2282,8 +2415,12 @@ class SiftViz(tk.Tk):
             lbl.config(text="")
         self.viewer_cluster_lbl.config(text="Click a point or cluster\nto preview media")
         self.nav_lbl.config(text="")
-        self.play_btn.config(text="▶  Play", command=self._play_media)
-        for btn in (self.prev_btn, self.next_btn, self.play_btn, self.open_btn, self.folder_btn):
+        self.play_pause_btn.config(text="▶  Play")
+        for btn in (
+            self.prev_btn, self.next_btn, self.play_pause_btn,
+            self.skip_back_btn, self.skip_fwd_btn,
+            self.open_btn, self.folder_btn,
+        ):
             btn.config(state="disabled")
 
     # ── Viewer: navigation ────────────────────────────────────────────────────
@@ -2304,40 +2441,105 @@ class SiftViz(tk.Tk):
         self._update_viewer()
         self._apply_selection_overlay()
 
-    # ── Viewer: actions ───────────────────────────────────────────────────────
+    # ── Viewer: playback controls ─────────────────────────────────────────────
 
-    def _play_media(self) -> None:
-        """Start inline video playback on the canvas for the current file."""
-        path = self._viewer.current_path
-        if not path:
+    def _toggle_play_pause(self) -> None:
+        """Toggle between playing and paused states for the current video."""
+        player = self._video_player
+        if not player:
             return
-        if not HAS_FFMPEG:
-            log.warning("ffmpeg not found — falling back to system open")
-            system_open(path)
-            return
-        log.info("starting inline playback: %s", path)
-        ok = self._video_player.play(path)
-        if not ok:
-            log.warning("could not start playback for %s", path)
-            return
-        self.play_btn.config(text="⏹  Stop", command=self._stop_video)
-        self.prev_btn.config(state="disabled")
-        self.next_btn.config(state="disabled")
 
-    def _stop_video(self) -> None:
-        """Stop inline playback and restore the static thumbnail view."""
-        if self._video_player:
-            self._video_player.stop()
-        self._on_video_end()
+        if player.is_playing:
+            # Currently playing → pause
+            player.pause()
+            self.play_pause_btn.config(text="▶  Play")
+            # Keep seek frame visible so user can scrub while paused
+
+        elif player.is_paused:
+            # Paused → resume
+            player.resume()
+            self.play_pause_btn.config(text="⏸  Pause")
+
+        else:
+            # Stopped → start from beginning
+            path = self._viewer.current_path
+            if not path:
+                return
+            if not HAS_FFMPEG:
+                log.warning("ffmpeg not found — falling back to system open")
+                system_open(path)
+                return
+            log.info("starting inline playback: %s", path)
+            ok = player.play(path, position_cb=self._on_position_update)
+            if not ok:
+                log.warning("could not start playback for %s", path)
+                return
+            # Configure seek bar
+            dur = player.duration
+            self.seek_scale.config(to=max(1.0, dur))
+            self.seek_var.set(0.0)
+            self.seek_pos_lbl.config(text="0:00")
+            self.seek_dur_lbl.config(text=_fmt_duration(dur))
+            self.seek_frame.grid()
+            self.play_pause_btn.config(text="⏸  Pause")
+            self.skip_back_btn.config(state="normal")
+            self.skip_fwd_btn.config(state="normal")
+            self.prev_btn.config(state="disabled")
+            self.next_btn.config(state="disabled")
+
+    def _skip_back(self) -> None:
+        """Skip backward 5 seconds."""
+        player = self._video_player
+        if player and (player.is_playing or player.is_paused):
+            player.seek(max(0.0, player.position - 5.0))
+            self.play_pause_btn.config(text="⏸  Pause")
+
+    def _skip_forward(self) -> None:
+        """Skip forward 5 seconds."""
+        player = self._video_player
+        if player and (player.is_playing or player.is_paused):
+            dur = player.duration
+            t = player.position + 5.0
+            if dur > 0:
+                t = min(t, dur)
+            player.seek(t)
+            self.play_pause_btn.config(text="⏸  Pause")
+
+    def _on_seek_press(self, _: Any) -> None:
+        """Mark the start of a user scrub drag."""
+        self._user_scrubbing = True
+
+    def _on_seek_release(self, _: Any) -> None:
+        """Seek to the scrub position when the user releases the slider."""
+        self._user_scrubbing = False
+        player = self._video_player
+        if player and (player.is_playing or player.is_paused):
+            player.seek(self.seek_var.get())
+            self.play_pause_btn.config(text="⏸  Pause")
+
+    def _on_seek_drag(self, val: Any) -> None:
+        """Update the current-position time label while the user drags."""
+        self.seek_pos_lbl.config(text=_fmt_duration(float(val)))
+
+    def _on_position_update(self, pos: float) -> None:
+        """Called by VideoPlayer each frame tick with the current position."""
+        if not self._user_scrubbing:
+            self.seek_var.set(pos)
+            self.seek_pos_lbl.config(text=_fmt_duration(pos))
 
     def _on_video_end(self) -> None:
-        """Called when playback ends naturally or is stopped — restores viewer state."""
-        self.play_btn.config(text="▶  Play", command=self._play_media)
+        """Called when playback ends naturally — restore viewer to thumbnail state."""
+        self.play_pause_btn.config(text="▶  Play")
+        self.seek_frame.grid_remove()
+        self.skip_back_btn.config(state="disabled")
+        self.skip_fwd_btn.config(state="disabled")
         v = self._viewer
         can_nav = v.is_multi
         self.prev_btn.config(state="normal" if can_nav else "disabled")
         self.next_btn.config(state="normal" if can_nav else "disabled")
         self._render_image()
+
+    # ── Viewer: file actions ──────────────────────────────────────────────────
 
     def _open_media(self) -> None:
         """Open the current file with the system default application."""
