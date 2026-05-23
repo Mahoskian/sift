@@ -13,6 +13,7 @@ Flow:
 
 from __future__ import annotations
 
+import hashlib
 import io
 import json
 import logging
@@ -425,6 +426,21 @@ def _fmt_hash_stats(n: int, total: int, elapsed: float) -> str:
         eta_str = f"ETA {_fmt_duration((total - n) / speed)}" if speed > 0 else "ETA --:--"
         parts = [f"{pct}%", f"{n}/{total}", speed_str, eta_str]
     return "  ·  ".join(p for p in parts if p)
+
+
+def _cache_dir(folder: str) -> Path:
+    key = hashlib.md5(folder.encode()).hexdigest()
+    return Path.home() / ".cache" / "sift" / key
+
+
+def _fmt_ago(seconds: float) -> str:
+    m = int(seconds) // 60
+    if m < 1:
+        return "just now"
+    if m < 60:
+        return f"{m} min"
+    h = m // 60
+    return f"{h}h {m % 60}m" if h < 24 else f"{h // 24}d {h % 24}h"
 
 
 # ── State dataclasses ─────────────────────────────────────────────────────────
@@ -957,6 +973,7 @@ class SiftViz(tk.Tk):
         self._cluster_running: bool = False
         self._cluster_n: int = 0
         self._cluster_total: int = 0
+        self._loading_from_cache: bool = False
 
         # Hit-test state rebuilt on every _redraw
         self._point_positions: np.ndarray | None = None  # (N,2) or (N,3)
@@ -1633,6 +1650,19 @@ class SiftViz(tk.Tk):
             anchor="w",
         )
         lbl.grid(row=0, column=1, padx=(10, 0))
+
+        # Keep label in sync when var is set programmatically (e.g. cache restore).
+        # command=_cb only fires on user interaction; the trace fires on any .set().
+        def _sync(*_: Any) -> None:
+            try:
+                v = int(var.get())
+                lbl.config(text=label_fn(v) if label_fn else str(v))
+            except Exception:
+                pass
+
+        tid = var.trace_add("write", _sync)
+        f.bind("<Destroy>", lambda _e, _t=tid: var.trace_remove("write", _t), add=True)
+
         return lbl
 
     def _labeled_slider(
@@ -1679,12 +1709,122 @@ class SiftViz(tk.Tk):
         )
         self._slider(parent, row + 1, var, lo, hi, on_change=self._on_slider)
 
+    # ── Cache helpers ─────────────────────────────────────────────────────────
+
+    def _save_cache(self) -> None:
+        """Persist the current pipeline results to ~/.cache/sift/<folder_hash>/."""
+        folder = self.folder_var.get().strip()
+        if not folder or not self._projection_2d or not self._cluster_data:
+            return
+        cache = _cache_dir(folder)
+        cache.mkdir(parents=True, exist_ok=True)
+
+        src = Path(self._hashes_json)
+        if src.exists():
+            shutil.copy2(src, cache / "hashes.json")
+
+        (cache / "projection_2d.json").write_text(json.dumps(self._projection_2d))
+        (cache / "projection_3d.json").write_text(json.dumps(self._projection_3d))
+        (cache / "clusters.json").write_text(json.dumps(self._cluster_data))
+
+        meta = {
+            "saved_at": time.time(),
+            "folder": folder,
+            "settings": {
+                "algo": self.algo_var.get(),
+                "hash_size": self.hash_size_var.get(),
+                "media": self.media_var.get(),
+                "frames": self.frames_var.get(),
+                "proj": self.proj_var.get(),
+                "dims": self.dims_var.get(),
+                "perplexity": self.perplexity_var.get(),
+                "iterations": self.iterations_var.get(),
+                "cluster_method": self.cluster_method_var.get(),
+                "threshold": self.threshold_var.get(),
+                "cut_height": self.cut_height_var.get(),
+                "linkage": self.linkage_var.get(),
+                "min_group": self.min_group_var.get(),
+                "min_filter": self.min_filter_var.get(),
+            },
+        }
+        (cache / "meta.json").write_text(json.dumps(meta, indent=2))
+        log.info("cache saved: %s", cache)
+
+    def _load_cache(self, folder: str) -> bool:
+        """Load a previously saved run from cache. Returns True if successful."""
+        cache = _cache_dir(folder)
+        required = [
+            "hashes.json", "projection_2d.json", "projection_3d.json",
+            "clusters.json", "meta.json",
+        ]
+        if not all((cache / f).exists() for f in required):
+            return False
+        try:
+            proj_2d  = json.loads((cache / "projection_2d.json").read_text())
+            proj_3d  = json.loads((cache / "projection_3d.json").read_text())
+            clusters = json.loads((cache / "clusters.json").read_text())
+            meta     = json.loads((cache / "meta.json").read_text())
+
+            # Copy hashes.json to tmpdir so hot-swap reprojection still works
+            shutil.copy2(cache / "hashes.json", Path(self.tmpdir) / "hashes.json")
+
+            # Restore UI settings
+            s = meta.get("settings", {})
+            if "algo"           in s: self.algo_var.set(s["algo"])
+            if "hash_size"      in s: self.hash_size_var.set(s["hash_size"])
+            if "media"          in s: self.media_var.set(s["media"])
+            if "frames"         in s: self.frames_var.set(s["frames"])
+            if "proj"           in s: self.proj_var.set(s["proj"])
+            if "dims"           in s: self.dims_var.set(s["dims"])
+            if "perplexity"     in s: self.perplexity_var.set(s["perplexity"])
+            if "iterations"     in s: self.iterations_var.set(s["iterations"])
+            if "cluster_method" in s: self.cluster_method_var.set(s["cluster_method"])
+            if "threshold"      in s: self.threshold_var.set(s["threshold"])
+            if "cut_height"     in s: self.cut_height_var.set(s["cut_height"])
+            if "linkage"        in s: self.linkage_var.set(s["linkage"])
+            if "min_group"      in s: self.min_group_var.set(s["min_group"])
+            if "min_filter"     in s: self.min_filter_var.set(s["min_filter"])
+            self._update_tsne_visibility()
+            self._update_frames_visibility()
+            self._rebuild_cluster_params()  # swap in correct widgets for restored method
+
+            # Load into memory and render
+            self._projection_2d = proj_2d
+            self._projection_3d = proj_3d
+            self._loading_from_cache = True
+            self._on_cluster_done(clusters)
+            self._loading_from_cache = False
+
+            saved_ago = time.time() - meta.get("saved_at", time.time())
+            self._set_status(f"Loaded from cache · saved {_fmt_ago(saved_ago)} ago")
+            log.info("cache loaded: %s (%s ago)", cache, _fmt_ago(saved_ago))
+            return True
+        except Exception as exc:
+            log.warning("cache load failed: %s", exc)
+            return False
+
     # ── Control callbacks ─────────────────────────────────────────────────────
 
     def _browse(self) -> None:
         """Open a directory picker and set ``folder_var`` to the chosen path."""
         if d := filedialog.askdirectory(title="Select image folder"):
             self.folder_var.set(d)
+            # Always wipe stale data from the previous folder first.
+            self._projection_2d = None
+            self._projection_3d = None
+            self._cluster_data = None
+            self._clear_viewer()
+            self._reset_axes()
+            self.canvas.draw()
+            self.hash_stats_lbl.config(text="")
+            self.proj_stats_lbl.config(text="")
+            self.cluster_stats_lbl.config(text="")
+            self.progress.config(mode="determinate", value=0)
+            self.proj_progress.config(mode="determinate", value=0)
+            self.cluster_progress.stop()
+            self.cluster_progress.config(mode="determinate", value=0)
+            if not self._load_cache(d):
+                self._set_status("No cache found — click Run to process")
 
     def _update_tsne_visibility(self) -> None:
         """Show or hide the t-SNE parameter frame based on the projection selection."""
@@ -2330,6 +2470,8 @@ class SiftViz(tk.Tk):
         log.info("cluster done — %d groups, %d ungrouped", n_groups, n_ungrouped)
         self._set_status(f"{n_groups} groups · {n_ungrouped} ungrouped")
         self._redraw()
+        if not self._loading_from_cache:
+            self._save_cache()
 
     # ── Axes management ───────────────────────────────────────────────────────
 
@@ -3033,6 +3175,8 @@ class SiftViz(tk.Tk):
         else:
             self._reset_axes()
             self.canvas.draw()
+
+        self._save_cache()
 
     def _remove_file_from_cluster_data(self, idx: int, path: str) -> None:
         """Remove file at *idx* from cluster data, shifting subsequent indices."""
