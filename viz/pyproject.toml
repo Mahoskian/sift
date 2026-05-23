@@ -1,22 +1,36 @@
 [project]
 name = "sift-viz"
-version = "0.1.0"
+version = "0.2.0"
 description = "Interactive visualization frontend for the sift perceptual hashing CLI"
 requires-python = ">=3.13"
 dependencies = [
     "matplotlib>=3.10.9",
     "numpy>=2.4.5",
-    "ruff>=0.15.13",
+    "pillow>=11.0",
+    "pydantic>=2.0",
+    "ruff>=0.11.0",
     "scipy>=1.17.1",
+    "send2trash>=1.8",
 ]
 
 [project.scripts]
 sift-viz = "visualize:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["sift_viz"]
 
 [tool.ruff]
 line-length = 100
 target-version = "py313"
 
 [tool.ruff.lint]
-select = ["E", "F", "I", "UP"]
-ignore = ["E501"]  # line length handled by formatter, not linter
+select = ["E", "F", "I", "UP", "B"]
+ignore = ["E501"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
