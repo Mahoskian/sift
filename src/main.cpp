@@ -506,9 +506,17 @@ static int cmd_cluster(int argc, char* argv[]) {
     std::cerr << "sift: loaded " << n << " hashes ("
               << input.algorithm << " " << input.hash_size << "x" << input.hash_size << ")\n";
 
-    // Compute distance matrix
+    // Compute distance matrix with per-row progress
     auto t_start = std::chrono::steady_clock::now();
-    auto dm = compute_distance_matrix(input.hashes, num_threads);
+    std::mutex dm_prog_mtx;
+    auto dm_progress = [&](int done, int total) {
+        char buf[80];
+        int len = std::snprintf(buf, sizeof(buf), "sift: progress %d/%d\n", done, total);
+        std::lock_guard<std::mutex> lk(dm_prog_mtx);
+        std::fwrite(buf, 1, static_cast<size_t>(len), stderr);
+        std::fflush(stderr);
+    };
+    auto dm = compute_distance_matrix(input.hashes, num_threads, dm_progress);
     auto t_dm = std::chrono::steady_clock::now();
     double dm_ms = std::chrono::duration<double, std::milli>(t_dm - t_start).count();
     std::cerr << "sift: computed " << n << "x" << n
@@ -694,7 +702,13 @@ static int cmd_project(int argc, char* argv[]) {
 
     ProjectionResult proj;
     if (method == "pca") {
-        proj = pca_project(features, dims);
+        auto pca_cb = [](int row, int total) {
+            char buf[80];
+            int len = std::snprintf(buf, sizeof(buf), "sift: progress %d/%d\n", row, total);
+            std::fwrite(buf, 1, static_cast<size_t>(len), stderr);
+            std::fflush(stderr);
+        };
+        proj = pca_project(features, dims, pca_cb);
         std::cerr << "sift: PCA variance explained:";
         for (int d = 0; d < proj.dims; d++)
             std::cerr << " " << (proj.variance_explained[d] * 100.0) << "%";
@@ -703,7 +717,13 @@ static int cmd_project(int argc, char* argv[]) {
         std::cerr << "sift: running t-SNE (dims=" << dims
                   << ", perplexity=" << perplexity
                   << ", iterations=" << iterations << ")\n";
-        proj = tsne_project(features, dims, perplexity, iterations, learning_rate);
+        auto tsne_cb = [](int iter, int total) {
+            char buf[80];
+            int len = std::snprintf(buf, sizeof(buf), "sift: progress %d/%d\n", iter, total);
+            std::fwrite(buf, 1, static_cast<size_t>(len), stderr);
+            std::fflush(stderr);
+        };
+        proj = tsne_project(features, dims, perplexity, iterations, learning_rate, tsne_cb);
     } else {
         std::cerr << "sift: unknown method '" << method << "'\n";
         return 1;

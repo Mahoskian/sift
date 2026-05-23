@@ -2,6 +2,7 @@
 
 #include "hash.hpp"
 
+#include <functional>
 #include <string>
 #include <vector>
 #include <limits>
@@ -31,7 +32,10 @@ struct DistanceMatrix {
     double avg_distance() const;
 };
 
-DistanceMatrix compute_distance_matrix(const std::vector<HashResult>& hashes, int num_threads);
+DistanceMatrix compute_distance_matrix(
+    const std::vector<HashResult>& hashes,
+    int num_threads,
+    std::function<void(int,int)> progress_cb = nullptr);
 
 // --- Groups ---
 

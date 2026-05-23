@@ -1,5 +1,6 @@
 #pragma once
 
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -22,7 +23,8 @@ std::vector<std::vector<double>> hashes_to_features(
 // Uses dual PCA (Gram matrix) — efficient when n_samples << n_features.
 ProjectionResult pca_project(
     const std::vector<std::vector<double>>& features,
-    int dims);
+    int dims,
+    std::function<void(int,int)> progress_cb = nullptr);
 
 // t-SNE: project into dims dimensions.
 // perplexity: effective number of neighbors (typically 5-50).
@@ -33,4 +35,5 @@ ProjectionResult tsne_project(
     int dims,
     double perplexity = 30.0,
     int max_iter = 1000,
-    double learning_rate = 200.0);
+    double learning_rate = 200.0,
+    std::function<void(int,int)> progress_cb = nullptr);

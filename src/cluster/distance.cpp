@@ -2,6 +2,7 @@
 #include "threadpool.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <future>
 
 int DistanceMatrix::min_distance() const {
@@ -32,15 +33,19 @@ double DistanceMatrix::avg_distance() const {
     return (double)sum / count;
 }
 
-DistanceMatrix compute_distance_matrix(const std::vector<HashResult>& hashes, int num_threads) {
+DistanceMatrix compute_distance_matrix(
+    const std::vector<HashResult>& hashes,
+    int num_threads,
+    std::function<void(int,int)> progress_cb)
+{
     int n = (int)hashes.size();
     DistanceMatrix dm;
     dm.n = n;
     dm.data.resize(n, std::vector<int>(n, 0));
 
-    // Parallelize by rows
     ThreadPool pool(num_threads);
     std::vector<std::future<void>> futures;
+    std::atomic<int> rows_done{0};
 
     for (int i = 0; i < n; i++) {
         futures.push_back(pool.submit([&, i]() {
@@ -49,6 +54,8 @@ DistanceMatrix compute_distance_matrix(const std::vector<HashResult>& hashes, in
                 dm.data[i][j] = d;
                 dm.data[j][i] = d;
             }
+            int done = ++rows_done;
+            if (progress_cb) progress_cb(done, n);
         }));
     }
 

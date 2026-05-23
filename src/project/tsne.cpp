@@ -81,7 +81,8 @@ ProjectionResult tsne_project(
     int dims,
     double perplexity,
     int max_iter,
-    double learning_rate)
+    double learning_rate,
+    std::function<void(int,int)> progress_cb)
 {
     int n = (int)features.size();
 
@@ -198,6 +199,8 @@ ProjectionResult tsne_project(
         for (int i = 0; i < n; i++)
             for (int d = 0; d < dims; d++)
                 Y[i][d] -= mean[d];
+
+        if (progress_cb) progress_cb(iter + 1, max_iter);
     }
 
     ProjectionResult result;

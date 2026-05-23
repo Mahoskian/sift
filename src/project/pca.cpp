@@ -107,7 +107,8 @@ std::vector<std::vector<double>> hashes_to_features(
 }
 
 ProjectionResult pca_project(
-    const std::vector<std::vector<double>>& features, int dims)
+    const std::vector<std::vector<double>>& features, int dims,
+    std::function<void(int,int)> progress_cb)
 {
     int n = (int)features.size();
     int d = n > 0 ? (int)features[0].size() : 0;
@@ -136,6 +137,7 @@ ProjectionResult pca_project(
             G[i][j] = dot;
             G[j][i] = dot;
         }
+        if (progress_cb) progress_cb(i + 1, n);
     }
 
     // Eigendecomposition of G

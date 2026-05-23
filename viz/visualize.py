@@ -401,16 +401,30 @@ def fit_image(img: Image.Image, max_w: int, max_h: int) -> Image.Image:
 
 
 def _fmt_duration(seconds: float) -> str:
-    """Format a duration in seconds as ``"M:SS"``.
+    """Format a duration in seconds as ``"M:SS.mmm"``."""
+    s = max(0.0, seconds)
+    m = int(s) // 60
+    sec = s - m * 60
+    return f"{m}:{sec:06.3f}"
 
-    Args:
-        seconds: Duration in seconds.
 
-    Returns:
-        Formatted string, e.g. ``"1:07"`` or ``"0:00"``.
+def _fmt_hash_stats(n: int, total: int, elapsed: float) -> str:
+    """Return a tqdm-style stats string for the hashing progress label.
+
+    Example outputs::
+
+        23%  ·  46/200  ·  12.3/s  ·  ETA 0:13
+        100%  ·  200/200  ·  14.1/s  ·  done in 0:22
     """
-    s = int(max(0.0, seconds))
-    return f"{s // 60}:{s % 60:02d}"
+    pct = int(n / total * 100) if total else 0
+    speed = n / elapsed if elapsed > 0.2 else 0.0
+    speed_str = f"{speed:.1f}/s" if speed > 0 else ""
+    if n >= total:
+        parts = ["100%", f"{n}/{total}", speed_str, f"done in {_fmt_duration(elapsed)}"]
+    else:
+        eta_str = f"ETA {_fmt_duration((total - n) / speed)}" if speed > 0 else "ETA --:--"
+        parts = [f"{pct}%", f"{n}/{total}", speed_str, eta_str]
+    return "  ·  ".join(p for p in parts if p)
 
 
 # ── State dataclasses ─────────────────────────────────────────────────────────
@@ -523,7 +537,8 @@ class VideoPlayer:
         # Per-segment state (reset on each _start_at call)
         self._proc: subprocess.Popen | None = None
         self._thread: threading.Thread | None = None
-        self._frame_q: queue.Queue[bytes | None] = queue.Queue(maxsize=16)
+        self._generation = 0      # incremented each _start_at; tags frames so stale Nones are discarded
+        self._frame_q: queue.Queue[tuple[int, bytes | None]] = queue.Queue(maxsize=16)
         self._frames_shown = 0
         self._seek_pos = 0.0      # start offset of current ffmpeg segment
         self._play_start = 0.0   # monotonic time when this segment began
@@ -638,6 +653,44 @@ class VideoPlayer:
         self._teardown_audio()
         self._start_at(t)
 
+    def seek_paused(self, t: float) -> None:
+        """Seek to *t* seconds and show a still frame without resuming playback.
+
+        Only does anything when the player is currently paused.
+
+        Args:
+            t: Target position in seconds.
+        """
+        if not self._path or not self._paused:
+            return
+        if self._duration > 0:
+            t = max(0.0, min(t, self._duration))
+        else:
+            t = max(0.0, t)
+        self._pause_pos = t
+        if self._proc is not None:
+            self._proc.terminate()
+            self._proc = None
+        self._drain_queue()
+        seek_args = ["-ss", f"{t:.3f}"] if t > 0 else []
+        self._proc = subprocess.Popen(
+            [
+                "ffmpeg", "-loglevel", "quiet",
+                *seek_args, "-i", self._path,
+                "-vf", f"scale={self._frame_w}:{self._frame_h}:flags=fast_bilinear",
+                "-vframes", "1",
+                "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        )
+        frame_bytes = self._frame_w * self._frame_h * 3
+        threading.Thread(
+            target=self._fetch_preview_frame,
+            args=(self._proc, frame_bytes, t),
+            daemon=True,
+        ).start()
+
     def stop(self) -> None:
         """Immediately halt playback and release all resources."""
         self._active = False
@@ -660,6 +713,8 @@ class VideoPlayer:
         self._seek_pos = t
         self._frames_shown = 0
         self._active = True
+        self._generation += 1
+        gen = self._generation
 
         seek_args = ["-ss", f"{t:.3f}"] if t > 0 else []
 
@@ -675,7 +730,7 @@ class VideoPlayer:
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
         )
-        self._thread = threading.Thread(target=self._read_frames, daemon=True)
+        self._thread = threading.Thread(target=self._read_frames, args=(gen,), daemon=True)
         self._thread.start()
 
         # ── Audio process via ffplay (no sounddevice / PortAudio involved) ────
@@ -696,6 +751,48 @@ class VideoPlayer:
 
         self._play_start = time.monotonic()
         self._tick()
+
+    def _fetch_preview_frame(
+        self, proc: subprocess.Popen, frame_bytes: int, t: float
+    ) -> None:
+        """Read one raw RGB frame from *proc* and schedule a canvas update."""
+        raw = b""
+        try:
+            while len(raw) < frame_bytes:
+                chunk = proc.stdout.read(frame_bytes - len(raw))
+                if not chunk:
+                    break
+                raw += chunk
+        except Exception:
+            pass
+        finally:
+            try:
+                proc.stdout.close()
+            except Exception:
+                pass
+            proc.wait()
+        if self._proc is proc:
+            self._proc = None
+        if len(raw) == frame_bytes and self._paused and self._pause_pos == t:
+            self._canvas.after(0, self._show_preview_frame, raw)
+
+    def _show_preview_frame(self, raw: bytes) -> None:
+        """Render a single still frame on the canvas (main thread, called after seek_paused)."""
+        if not self._paused:
+            return
+        img = Image.frombytes("RGB", (self._frame_w, self._frame_h), raw)
+        photo = ImageTk.PhotoImage(img)
+        self._photo = photo
+        cw = self._canvas.winfo_width()
+        ch = self._canvas.winfo_height()
+        self._canvas.delete("all")
+        self._canvas.create_image(
+            max(0, (cw - self._frame_w) // 2),
+            max(0, (ch - self._frame_h) // 2),
+            anchor="nw", image=photo,
+        )
+        if self._position_cb is not None:
+            self._position_cb(self._pause_pos)
 
     def _cancel_tick(self) -> None:
         """Cancel any pending after() tick callback."""
@@ -720,7 +817,7 @@ class VideoPlayer:
             self._audio_proc.terminate()
             self._audio_proc = None
 
-    def _read_frames(self) -> None:
+    def _read_frames(self, gen: int) -> None:
         """Reader thread: pulls raw RGB frames from ffmpeg stdout into the queue."""
         frame_bytes = self._frame_w * self._frame_h * 3
         proc = self._proc
@@ -728,12 +825,12 @@ class VideoPlayer:
             raw = proc.stdout.read(frame_bytes)
             if not raw or len(raw) < frame_bytes:
                 try:
-                    self._frame_q.put(None, timeout=2.0)
+                    self._frame_q.put((gen, None), timeout=2.0)
                 except queue.Full:
                     pass
                 break
             try:
-                self._frame_q.put(raw, timeout=2.0)
+                self._frame_q.put((gen, raw), timeout=2.0)
             except queue.Full:
                 pass  # drop frame — display is lagging
 
@@ -745,12 +842,16 @@ class VideoPlayer:
         elapsed = time.monotonic() - self._play_start
         target = int(elapsed * self._fps)
 
+        cur = self._generation
+
         # Drop frames that we're behind on (video fell behind clock)
         while self._frames_shown < target:
             try:
-                stale = self._frame_q.get_nowait()
+                gen, stale = self._frame_q.get_nowait()
             except queue.Empty:
                 break
+            if gen != cur:
+                continue  # stale item from a superseded segment — discard
             if stale is None:
                 self._active = False
                 self._on_end()
@@ -758,11 +859,15 @@ class VideoPlayer:
             self._frames_shown += 1
 
         # Fetch the next frame to display
-        try:
-            raw = self._frame_q.get_nowait()
-        except queue.Empty:
-            self._after_id = self._canvas.after(5, self._tick)
-            return
+        while True:
+            try:
+                gen, raw = self._frame_q.get_nowait()
+            except queue.Empty:
+                self._after_id = self._canvas.after(5, self._tick)
+                return
+            if gen == cur:
+                break
+            # stale item from a superseded segment — discard and retry
 
         if raw is None:
             self._active = False
@@ -837,7 +942,21 @@ class SiftViz(tk.Tk):
         self._cancel_requested = False
         self._current_proc: subprocess.Popen | None = None
         self._cluster_timer: str | None = None
+        self._proj_timer: str | None = None
         self._poll_id: str | None = None
+
+        # Stage timing for stats labels
+        self._hash_start: float = 0.0
+        self._hash_n: int = 0
+        self._hash_total: int = 0
+        self._proj_start: float = 0.0
+        self._proj_running: bool = False
+        self._proj_n: int = 0
+        self._proj_total: int = 0
+        self._cluster_start: float = 0.0
+        self._cluster_running: bool = False
+        self._cluster_n: int = 0
+        self._cluster_total: int = 0
 
         # Hit-test state rebuilt on every _redraw
         self._point_positions: np.ndarray | None = None  # (N,2) or (N,3)
@@ -935,11 +1054,11 @@ class SiftViz(tk.Tk):
         ctrl.columnconfigure(0, weight=1)
         r = 0
 
-        # Folder picker
+        # Folder picker + media type grouped together under INPUT
         self._section_label(ctrl, r, "INPUT")
         r += 1
         ff = tk.Frame(ctrl, bg=PANEL_BG)
-        ff.grid(row=r, column=0, sticky="ew", padx=12, pady=(0, 8))
+        ff.grid(row=r, column=0, sticky="ew", padx=12, pady=(0, 4))
         r += 1
         ff.columnconfigure(0, weight=1)
         tk.Entry(
@@ -952,6 +1071,50 @@ class SiftViz(tk.Tk):
             bd=4,
         ).grid(row=0, column=0, sticky="ew")
         self._flat_btn(ff, "Browse", self._browse).grid(row=0, column=1, padx=(4, 0))
+
+        # Media type (grouped with input — affects what gets hashed)
+        self._section_label(ctrl, r, "MEDIA TYPE")
+        r += 1
+        mf = tk.Frame(ctrl, bg=PANEL_BG)
+        mf.grid(row=r, column=0, sticky="ew", padx=12)
+        r += 1
+        for i, (value, label) in enumerate(
+            (("images", "Images only"), ("videos", "Videos only"), ("all", "Both"))
+        ):
+            tk.Radiobutton(
+                mf,
+                text=label,
+                variable=self.media_var,
+                value=value,
+                bg=PANEL_BG,
+                fg=TEXT_COLOR,
+                selectcolor=PANEL_BG,
+                activebackground=PANEL_BG,
+                activeforeground=TEXT_COLOR,
+                font=("", 9),
+                anchor="w",
+                command=self._on_media_type_change,
+            ).grid(row=i, column=0, sticky="w")
+
+        self.frames_frame = tk.Frame(ctrl, bg=PANEL_BG)
+        self.frames_frame.grid(row=r, column=0, sticky="ew")
+        r += 1
+        self.frames_frame.columnconfigure(0, weight=1)
+        tk.Label(
+            self.frames_frame, text="Frames per video", bg=PANEL_BG, fg=DIM_COLOR, font=("", 8)
+        ).grid(row=0, column=0, sticky="w", padx=12, pady=(4, 0))
+        self._slider(
+            self.frames_frame,
+            1,
+            self.frames_var,
+            1,
+            32,
+            label_fn=lambda v: f"{v} frame{'s' if v != 1 else ''}",
+        )
+        self._update_frames_visibility()
+
+        self._divider(ctrl, r)
+        r += 1
 
         # Hash algo
         self._section_label(ctrl, r, "HASH ALGORITHM")
@@ -973,68 +1136,7 @@ class SiftViz(tk.Tk):
         )
         r += 1
 
-        # Media type
-        self._section_label(ctrl, r, "MEDIA TYPE")
-        r += 1
-        for value, label in (("images", "Images only"), ("videos", "Videos only"), ("all", "Both")):
-            tk.Radiobutton(
-                ctrl,
-                text=label,
-                variable=self.media_var,
-                value=value,
-                bg=PANEL_BG,
-                fg=TEXT_COLOR,
-                selectcolor=PANEL_BG,
-                activebackground=PANEL_BG,
-                activeforeground=TEXT_COLOR,
-                font=("", 9),
-                anchor="w",
-                command=self._on_media_type_change,
-            ).grid(row=r, column=0, sticky="w", padx=12)
-            r += 1
-
-        self.frames_frame = tk.Frame(ctrl, bg=PANEL_BG)
-        self.frames_frame.grid(row=r, column=0, sticky="ew")
-        r += 1
-        self.frames_frame.columnconfigure(0, weight=1)
-        tk.Label(
-            self.frames_frame, text="Frames per video", bg=PANEL_BG, fg=DIM_COLOR, font=("", 8)
-        ).grid(row=0, column=0, sticky="w", padx=12, pady=(4, 0))
-        self._slider(
-            self.frames_frame,
-            1,
-            self.frames_var,
-            1,
-            32,
-            label_fn=lambda v: f"{v} frame{'s' if v != 1 else ''}",
-        )
-        self._update_frames_visibility()
-
-        # Projection method
-        self._section_label(ctrl, r, "PROJECTION")
-        r += 1
-        for proj, label in (("pca", "PCA"), ("tsne", "t-SNE")):
-            self._radio(
-                ctrl,
-                r,
-                label,
-                self.proj_var,
-                proj,
-                command=self._update_tsne_visibility,
-            )
-            r += 1
-
-        self.tsne_frame = tk.Frame(ctrl, bg=PANEL_BG)
-        self.tsne_frame.grid(row=r, column=0, sticky="ew")
-        r += 1
-        self.tsne_frame.columnconfigure(0, weight=1)
-        self._labeled_slider(self.tsne_frame, 0, "Perplexity", self.perplexity_var, 5, 100)
-        self._labeled_slider(self.tsne_frame, 2, "Iterations", self.iterations_var, 250, 3000)
-
-        self._divider(ctrl, r)
-        r += 1
-
-        # Run button + progress + status
+        # Run button + hashing progress live under HASH SIZE
         self.run_btn = tk.Button(
             ctrl,
             text="Run",
@@ -1052,7 +1154,12 @@ class SiftViz(tk.Tk):
         r += 1
 
         self.progress = ttk.Progressbar(ctrl, mode="determinate", maximum=100, value=0, length=100)
-        self.progress.grid(row=r, column=0, sticky="ew", padx=12, pady=(0, 4))
+        self.progress.grid(row=r, column=0, sticky="ew", padx=12, pady=(0, 2))
+        r += 1
+        self.hash_stats_lbl = tk.Label(
+            ctrl, text="", bg=PANEL_BG, fg=DIM_COLOR, font=("", 8), anchor="w"
+        )
+        self.hash_stats_lbl.grid(row=r, column=0, sticky="ew", padx=12, pady=(0, 4))
         r += 1
 
         self.status_lbl = tk.Label(
@@ -1067,6 +1174,48 @@ class SiftViz(tk.Tk):
         self.status_lbl.grid(row=r, column=0, sticky="w", padx=12, pady=(0, 6))
         r += 1
 
+        # Projection — separated from hashing by a divider
+        self._divider(ctrl, r)
+        r += 1
+        self._section_label(ctrl, r, "PROJECTION")
+        r += 1
+
+        # Progress + stats live right under the title (mirrors CLUSTERING layout)
+        self.proj_progress = ttk.Progressbar(
+            ctrl, mode="determinate", maximum=100, value=0, length=100
+        )
+        self.proj_progress.grid(row=r, column=0, sticky="ew", padx=12, pady=(0, 2))
+        r += 1
+        self.proj_stats_lbl = tk.Label(
+            ctrl, text="", bg=PANEL_BG, fg=DIM_COLOR, font=("", 8), anchor="w"
+        )
+        self.proj_stats_lbl.grid(row=r, column=0, sticky="ew", padx=12, pady=(0, 4))
+        r += 1
+
+        for proj, label in (("pca", "PCA"), ("tsne", "t-SNE")):
+            self._radio(
+                ctrl,
+                r,
+                label,
+                self.proj_var,
+                proj,
+                command=self._on_proj_method_change,
+            )
+            r += 1
+
+        self.tsne_frame = tk.Frame(ctrl, bg=PANEL_BG)
+        self.tsne_frame.grid(row=r, column=0, sticky="ew")
+        r += 1
+        self.tsne_frame.columnconfigure(0, weight=1)
+        self._labeled_slider(
+            self.tsne_frame, 0, "Perplexity", self.perplexity_var, 5, 100,
+            on_change=self._schedule_reprojection,
+        )
+        self._labeled_slider(
+            self.tsne_frame, 2, "Iterations", self.iterations_var, 250, 3000,
+            on_change=self._schedule_reprojection,
+        )
+
         # Clustering
         self._divider(ctrl, r)
         r += 1
@@ -1076,7 +1225,12 @@ class SiftViz(tk.Tk):
         self.cluster_progress = ttk.Progressbar(
             ctrl, mode="determinate", maximum=100, value=0, length=100
         )
-        self.cluster_progress.grid(row=r, column=0, sticky="ew", padx=12, pady=(0, 6))
+        self.cluster_progress.grid(row=r, column=0, sticky="ew", padx=12, pady=(0, 2))
+        r += 1
+        self.cluster_stats_lbl = tk.Label(
+            ctrl, text="", bg=PANEL_BG, fg=DIM_COLOR, font=("", 8), anchor="w"
+        )
+        self.cluster_stats_lbl.grid(row=r, column=0, sticky="ew", padx=12, pady=(0, 4))
         r += 1
 
         for method in ("threshold", "hierarchical", "hdbscan"):
@@ -1233,12 +1387,14 @@ class SiftViz(tk.Tk):
         act = tk.Frame(v, bg=PANEL_BG)
         act.grid(row=8, column=0, pady=(8, 0))
         self.prev_btn = self._icon_btn(act, "◀", self._viewer_prev, col=0)
-        self.nav_lbl = tk.Label(act, text="", bg=PANEL_BG, fg=DIM_COLOR, font=("", 8), width=5)
+        self.nav_lbl = tk.Label(act, text="", bg=PANEL_BG, fg=DIM_COLOR, font=("", 8))
         self.nav_lbl.grid(row=0, column=1, padx=2)
-        self.open_btn = self._action_btn(act, "↗  Open", self._open_media, col=2)
-        self.folder_btn = self._action_btn(act, "⌂  Folder", self._open_in_folder, col=3)
-        self.next_btn = self._icon_btn(act, "▶", self._viewer_next, col=4)
-        for b in (self.prev_btn, self.next_btn, self.open_btn, self.folder_btn):
+        self.delete_btn = self._action_btn(act, "✗  Del", self._delete_current_media, col=2)
+        self.delete_btn.config(bg="#3a1a1a", activebackground="#5a2020")
+        self.open_btn = self._action_btn(act, "↗  Open", self._open_media, col=3)
+        self.folder_btn = self._action_btn(act, "⌂  Folder", self._open_in_folder, col=4)
+        self.next_btn = self._icon_btn(act, "▶", self._viewer_next, col=5)
+        for b in (self.prev_btn, self.next_btn, self.delete_btn, self.open_btn, self.folder_btn):
             b.config(state="disabled")
 
         self.viewer_path_lbl = self._viewer_label(v, 9, fg="#383838", font=("", 7), pady=(6, 12))
@@ -1618,30 +1774,86 @@ class SiftViz(tk.Tk):
                 kind = msg["kind"]
                 if kind == "status":
                     self._set_status(msg["text"], msg.get("error", False))
+                elif kind == "hash_start":
+                    self._hash_start = time.monotonic()
+                    self._hash_n = 0
+                    self._hash_total = 0
+                    self.hash_stats_lbl.config(text="starting…")
                 elif kind == "progress":
                     n, total = msg["value"], msg["total"]
                     if total > 0:
-                        pct = (n / total) * 100
-                        self.progress.config(mode="determinate", value=pct)
+                        self.progress.config(mode="determinate", value=(n / total) * 100)
+                        self._hash_n = n
+                        self._hash_total = total
+                        elapsed = time.monotonic() - self._hash_start if self._hash_start else 0.0
+                        self.hash_stats_lbl.config(text=_fmt_hash_stats(n, total, elapsed))
                 elif kind == "progress_indeterminate":
                     self.progress.config(mode="indeterminate")
                     self.progress.start(12)
+                elif kind == "proj_progress_indeterminate":
+                    self._proj_start = time.monotonic()
+                    self._proj_running = True
+                    self._proj_n = 0
+                    self._proj_total = 0
+                    self.proj_progress.config(mode="indeterminate")
+                    self.proj_progress.start(12)
+                elif kind == "proj_progress":
+                    n, total = msg["value"], msg["total"]
+                    if total > 0:
+                        self.proj_progress.stop()
+                        self.proj_progress.config(mode="determinate", value=(n / total) * 100)
+                        self._proj_n = n
+                        self._proj_total = total
+                        elapsed = time.monotonic() - self._proj_start if self._proj_start else 0.0
+                        self.proj_stats_lbl.config(text=_fmt_hash_stats(n, total, elapsed))
+                elif kind == "cluster_progress":
+                    n, total = msg["value"], msg["total"]
+                    if total > 0:
+                        self.cluster_progress.stop()
+                        self.cluster_progress.config(mode="determinate", value=(n / total) * 100)
+                        self._cluster_n = n
+                        self._cluster_total = total
+                        elapsed = time.monotonic() - self._cluster_start if self._cluster_start else 0.0
+                        self.cluster_stats_lbl.config(text=_fmt_hash_stats(n, total, elapsed))
                 elif kind == "pipeline_done":
                     self._on_pipeline_done(msg["projection_2d"], msg["projection_3d"])
+                elif kind == "projection_done":
+                    self._on_projection_done(msg["projection_2d"], msg["projection_3d"])
+                elif kind == "projection_error":
+                    self._proj_running = False
+                    self.proj_progress.stop()
+                    self.proj_progress.config(mode="determinate", value=0)
+                    self.proj_stats_lbl.config(text="error")
+                    self._set_status(f"Projection error: {msg['text']}", error=True)
                 elif kind == "cluster_done":
                     self._on_cluster_done(msg["clusters"])
                 elif kind == "cancelled":
                     self._running = False
+                    self._proj_running = False
+                    self._cluster_running = False
                     self._reset_run_button()
                     self._set_status("Cancelled.")
                 elif kind == "cluster_error":
+                    self._cluster_running = False
                     self.cluster_progress.stop()
                     self.cluster_progress.config(mode="determinate", value=0)
+                    self.cluster_stats_lbl.config(text="error")
                     self._set_status(msg["text"], error=True)
                 elif kind == "error":
+                    self._proj_running = False
                     self._on_error(msg["text"])
         except queue.Empty:
             pass
+
+        # Live elapsed-time ticks — only shown when no per-item progress data available
+        now = time.monotonic()
+        if self._proj_running and self._proj_start and self._proj_total == 0:
+            self.proj_stats_lbl.config(text=f"elapsed  {_fmt_duration(now - self._proj_start)}")
+        if self._cluster_running and self._cluster_start and self._cluster_total == 0:
+            self.cluster_stats_lbl.config(
+                text=f"elapsed  {_fmt_duration(now - self._cluster_start)}"
+            )
+
         self._poll_id = self.after(50, self._poll)
 
     # ── Pipeline ──────────────────────────────────────────────────────────────
@@ -1657,6 +1869,8 @@ class SiftViz(tk.Tk):
         )
         self.progress.stop()
         self.progress.config(mode="determinate", value=0)
+        self.proj_progress.stop()
+        self.proj_progress.config(mode="determinate", value=0)
 
     def _on_cancel(self) -> None:
         """Cancel the running pipeline by terminating the current subprocess."""
@@ -1686,11 +1900,26 @@ class SiftViz(tk.Tk):
             self.algo_var.get(),
             self.proj_var.get(),
         )
+        if self._proj_timer:
+            self.after_cancel(self._proj_timer)
+            self._proj_timer = None
         self._running = True
         self._cancel_requested = False
         self._projection_2d = None
         self._projection_3d = None
         self._cluster_data = None
+        self._hash_start = 0.0
+        self._hash_n = 0
+        self._hash_total = 0
+        self._proj_running = False
+        self._proj_n = 0
+        self._proj_total = 0
+        self._cluster_running = False
+        self._cluster_n = 0
+        self._cluster_total = 0
+        self.hash_stats_lbl.config(text="")
+        self.proj_stats_lbl.config(text="")
+        self.cluster_stats_lbl.config(text="")
         self.run_btn.config(
             text="Cancel",
             bg="#c0392b",
@@ -1709,11 +1938,13 @@ class SiftViz(tk.Tk):
         stage: str,
         *,
         stream_progress: bool = False,
+        progress_kind: str = "progress",
+        progress_transform: Any = None,
     ) -> tuple[int, str]:
         """Run *cmd* in a subprocess, streaming stderr line by line.
 
-        Lines matching ``sift: progress N/TOTAL`` are turned into
-        ``{"kind": "progress"}`` queue messages rather than being logged.
+        Lines matching ``sift: progress N/TOTAL`` are turned into queue
+        messages of type *progress_kind* rather than being logged.
         All other non-empty lines are forwarded to the logger.
 
         Args:
@@ -1721,6 +1952,9 @@ class SiftViz(tk.Tk):
             stage: Short label used in log messages (e.g. ``"hash"``).
             stream_progress: When ``True``, parse progress lines and emit
                 queue updates; otherwise log all stderr lines normally.
+            progress_kind: Queue message kind for progress lines
+                (default ``"progress"`` for hashing; use ``"proj_progress"``
+                for projection).
 
         Returns:
             ``(returncode, joined_stderr)`` tuple.
@@ -1740,7 +1974,9 @@ class SiftViz(tk.Tk):
                 try:
                     frac = line.split()[-1]  # "N/TOTAL"
                     n, total = map(int, frac.split("/"))
-                    self._q.put({"kind": "progress", "value": n, "total": total})
+                    if progress_transform:
+                        n, total = progress_transform(n, total)
+                    self._q.put({"kind": progress_kind, "value": n, "total": total})
                 except Exception:
                     pass
             else:
@@ -1772,6 +2008,7 @@ class SiftViz(tk.Tk):
             self._q.put(
                 {"kind": "status", "text": f"Hashing {media_label} with {algo} {size}×{size}…"}
             )
+            self._q.put({"kind": "hash_start"})
             hash_cmd = [
                 self.binary,
                 "hash",
@@ -1793,7 +2030,20 @@ class SiftViz(tk.Tk):
                 raise RuntimeError(stderr.splitlines()[-1] if stderr else "sift hash failed")
 
             # ── Project (both 2D and 3D so toggling needs no re-run) ──────────
-            self._q.put({"kind": "progress_indeterminate"})
+            self._q.put({"kind": "proj_progress_indeterminate"})
+
+            # Phase tracking: combine 2D (phase 0) and 3D (phase 1) into a
+            # single 0→100% range so the bar never resets mid-run.
+            phase_info: dict[str, int] = {"phase": 0, "total": 0}
+
+            def make_proj_transform() -> Any:
+                phase = phase_info["phase"]
+                def transform(n: int, total: int) -> tuple[int, int]:
+                    if phase == 0:
+                        phase_info["total"] = total
+                    pt = phase_info["total"]
+                    return phase * pt + n, max(1, pt) * 2
+                return transform
 
             def run_projection(dims: int, out_path: str) -> dict:
                 self._q.put(
@@ -1815,7 +2065,13 @@ class SiftViz(tk.Tk):
                         f"--perplexity={int(self.perplexity_var.get())}",
                         f"--iterations={int(self.iterations_var.get())}",
                     ]
-                rc, stderr = self._run_subprocess(cmd, "project")
+                rc, stderr = self._run_subprocess(
+                    cmd, "project",
+                    stream_progress=True,
+                    progress_kind="proj_progress",
+                    progress_transform=make_proj_transform(),
+                )
+                phase_info["phase"] += 1
                 if self._cancel_requested:
                     return {}
                 if rc != 0:
@@ -1849,10 +2105,15 @@ class SiftViz(tk.Tk):
             proj_3d: Parsed JSON dict from ``sift project --dims=3``.
         """
         self._running = False
+        self._proj_running = False
         self._projection_2d = proj_2d
         self._projection_3d = proj_3d
         n = len(proj_2d["files"])
-        self._reset_run_button()
+        self._reset_run_button()  # stops progress bars
+        if self._proj_start:
+            self.proj_stats_lbl.config(
+                text=f"done in  {_fmt_duration(time.monotonic() - self._proj_start)}"
+            )
         method = proj_2d.get("method", "?").upper()
         msg = f"{method} done — {n} files, 2D+3D ready. Adjust clustering below."
         log.info(msg)
@@ -1871,6 +2132,107 @@ class SiftViz(tk.Tk):
 
     # ── Clustering ────────────────────────────────────────────────────────────
 
+    # ── Projection (hot-swap) ─────────────────────────────────────────────────
+
+    def _on_proj_method_change(self) -> None:
+        """Handle projection method radio change — update t-SNE visibility and re-project."""
+        self._update_tsne_visibility()
+        self._schedule_reprojection()
+
+    def _schedule_reprojection(self) -> None:
+        """Debounce re-projection: wait 350 ms after the last param change."""
+        if not Path(self._hashes_json).exists() or self._running:
+            return
+        if self._proj_timer:
+            self.after_cancel(self._proj_timer)
+        self._proj_timer = self.after(350, self._run_projection)
+
+    def _run_projection(self) -> None:
+        """Re-run sift project with current params and refresh the scatter."""
+        self._proj_timer = None
+        if self._running or not Path(self._hashes_json).exists():
+            return
+        proj_m = self.proj_var.get()
+        self._proj_start = time.monotonic()
+        self._proj_running = True
+        self._proj_n = 0
+        self._proj_total = 0
+        self.proj_stats_lbl.config(text="")
+        self.proj_progress.config(mode="indeterminate")
+        self.proj_progress.start(12)
+
+        def make_cmd(dims: int, out: str) -> list[str]:
+            cmd = [
+                self.binary, "project", self._hashes_json,
+                f"--method={proj_m}", f"--dims={dims}", f"--output={out}",
+            ]
+            if proj_m == "tsne":
+                cmd += [
+                    f"--perplexity={int(self.perplexity_var.get())}",
+                    f"--iterations={int(self.iterations_var.get())}",
+                ]
+            return cmd
+
+        threading.Thread(
+            target=self._projection_thread,
+            args=(make_cmd(2, self._proj_2d_json), make_cmd(3, self._proj_3d_json)),
+            daemon=True,
+        ).start()
+
+    def _projection_thread(self, cmd_2d: list[str], cmd_3d: list[str]) -> None:
+        """Background thread: run sift project for 2D and 3D, push result to queue."""
+        try:
+            phase_total = 0
+            for phase, (cmd, label) in enumerate(((cmd_2d, "2D"), (cmd_3d, "3D"))):
+                proc = subprocess.Popen(
+                    cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True
+                )
+                for raw in proc.stderr:
+                    line = raw.strip()
+                    if not line:
+                        continue
+                    if line.startswith("sift: progress "):
+                        try:
+                            frac = line.split()[-1]
+                            pn, ptotal = map(int, frac.split("/"))
+                            if phase == 0:
+                                phase_total = ptotal
+                            combined_n = phase * phase_total + pn
+                            combined_total = max(1, phase_total) * 2
+                            self._q.put({"kind": "proj_progress", "value": combined_n, "total": combined_total})
+                        except Exception:
+                            pass
+                    else:
+                        _log_stderr(line, "project")
+                proc.wait()
+                if proc.returncode != 0:
+                    raise RuntimeError(f"sift project {label} failed")
+            with open(self._proj_2d_json) as fh:
+                proj_2d = json.load(fh)
+            with open(self._proj_3d_json) as fh:
+                proj_3d = json.load(fh)
+            self._q.put({"kind": "projection_done", "projection_2d": proj_2d, "projection_3d": proj_3d})
+        except Exception as exc:
+            log.warning("projection error: %s", exc)
+            self._q.put({"kind": "projection_error", "text": str(exc)})
+
+    def _on_projection_done(self, proj_2d: dict, proj_3d: dict) -> None:
+        """Handle a hot-swap re-projection — update scatter without re-hashing/clustering."""
+        if self._running:
+            return  # main pipeline supersedes this result
+        self._proj_running = False
+        self._projection_2d = proj_2d
+        self._projection_3d = proj_3d
+        self.proj_progress.stop()
+        self.proj_progress.config(mode="determinate", value=0)
+        if self._proj_start:
+            self.proj_stats_lbl.config(
+                text=f"done in  {_fmt_duration(time.monotonic() - self._proj_start)}"
+            )
+        self._redraw()
+
+    # ── Clustering ────────────────────────────────────────────────────────────
+
     def _schedule_recluster(self) -> None:
         """Debounce cluster requests: wait 350 ms after the last slider move."""
         if self._projection_2d is None:
@@ -1883,6 +2245,11 @@ class SiftViz(tk.Tk):
         """Build the ``sift cluster`` command from current UI state and run it."""
         if self._projection_2d is None:
             return
+        self._cluster_start = time.monotonic()
+        self._cluster_running = True
+        self._cluster_n = 0
+        self._cluster_total = 0
+        self.cluster_stats_lbl.config(text="")
         self.cluster_progress.config(mode="indeterminate")
         self.cluster_progress.start(12)
         method = self.cluster_method_var.get()
@@ -1914,10 +2281,25 @@ class SiftViz(tk.Tk):
             cmd: Full argument list for ``sift cluster``.
         """
         try:
-            r = subprocess.run(cmd, capture_output=True, text=True)
-            if r.returncode != 0:
-                raise RuntimeError(r.stderr.strip() or "sift cluster failed")
-            _log_stderr(r.stderr, "cluster")
+            proc = subprocess.Popen(
+                cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True
+            )
+            for raw in proc.stderr:
+                line = raw.strip()
+                if not line:
+                    continue
+                if line.startswith("sift: progress "):
+                    try:
+                        frac = line.split()[-1]
+                        cn, ctotal = map(int, frac.split("/"))
+                        self._q.put({"kind": "cluster_progress", "value": cn, "total": ctotal})
+                    except Exception:
+                        pass
+                else:
+                    _log_stderr(line, "cluster")
+            proc.wait()
+            if proc.returncode != 0:
+                raise RuntimeError("sift cluster failed")
             with open(self._clusters_json) as fh:
                 clusters = json.load(fh)
             self._q.put({"kind": "cluster_done", "clusters": clusters})
@@ -1931,14 +2313,22 @@ class SiftViz(tk.Tk):
         Args:
             clusters: Parsed JSON dict from ``sift cluster``.
         """
+        self._cluster_running = False
         self.cluster_progress.stop()
         self.cluster_progress.config(mode="determinate", value=0)
         self._cluster_data = clusters
         n_groups = len(clusters.get("groups", []))
         n_ungrouped = len(clusters.get("ungrouped", []))
-        msg = f"{n_groups} groups · {n_ungrouped} ungrouped"
-        log.info("cluster done — %s", msg)
-        self._set_status(msg)
+        elapsed_str = (
+            f"done in  {_fmt_duration(time.monotonic() - self._cluster_start)}  ·  "
+            if self._cluster_start
+            else ""
+        )
+        self.cluster_stats_lbl.config(
+            text=f"{elapsed_str}{n_groups} groups  ·  {n_ungrouped} ungrouped"
+        )
+        log.info("cluster done — %d groups, %d ungrouped", n_groups, n_ungrouped)
+        self._set_status(f"{n_groups} groups · {n_ungrouped} ungrouped")
         self._redraw()
 
     # ── Axes management ───────────────────────────────────────────────────────
@@ -2303,6 +2693,7 @@ class SiftViz(tk.Tk):
         self.play_pause_btn.config(state="normal" if is_video else "disabled")
         self.skip_back_btn.config(state="disabled")
         self.skip_fwd_btn.config(state="disabled")
+        self.delete_btn.config(state="normal")
         self.open_btn.config(state="normal")
         self.folder_btn.config(state="normal")
 
@@ -2419,7 +2810,7 @@ class SiftViz(tk.Tk):
         for btn in (
             self.prev_btn, self.next_btn, self.play_pause_btn,
             self.skip_back_btn, self.skip_fwd_btn,
-            self.open_btn, self.folder_btn,
+            self.delete_btn, self.open_btn, self.folder_btn,
         ):
             btn.config(state="disabled")
 
@@ -2484,25 +2875,32 @@ class SiftViz(tk.Tk):
             self.play_pause_btn.config(text="⏸  Pause")
             self.skip_back_btn.config(state="normal")
             self.skip_fwd_btn.config(state="normal")
-            self.prev_btn.config(state="disabled")
-            self.next_btn.config(state="disabled")
 
     def _skip_back(self) -> None:
-        """Skip backward 5 seconds."""
+        """Skip backward 1 second."""
         player = self._video_player
-        if player and (player.is_playing or player.is_paused):
-            player.seek(max(0.0, player.position - 5.0))
+        if not player:
+            return
+        new_pos = max(0.0, player.position - 1.0)
+        if player.is_paused:
+            player.seek_paused(new_pos)
+        elif player.is_playing:
+            player.seek(new_pos)
             self.play_pause_btn.config(text="⏸  Pause")
 
     def _skip_forward(self) -> None:
-        """Skip forward 5 seconds."""
+        """Skip forward 1 second."""
         player = self._video_player
-        if player and (player.is_playing or player.is_paused):
-            dur = player.duration
-            t = player.position + 5.0
-            if dur > 0:
-                t = min(t, dur)
-            player.seek(t)
+        if not player:
+            return
+        dur = player.duration
+        new_pos = player.position + 1.0
+        if dur > 0:
+            new_pos = min(new_pos, dur)
+        if player.is_paused:
+            player.seek_paused(new_pos)
+        elif player.is_playing:
+            player.seek(new_pos)
             self.play_pause_btn.config(text="⏸  Pause")
 
     def _on_seek_press(self, _: Any) -> None:
@@ -2513,8 +2911,13 @@ class SiftViz(tk.Tk):
         """Seek to the scrub position when the user releases the slider."""
         self._user_scrubbing = False
         player = self._video_player
-        if player and (player.is_playing or player.is_paused):
-            player.seek(self.seek_var.get())
+        if not player:
+            return
+        t = self.seek_var.get()
+        if player.is_paused:
+            player.seek_paused(t)
+        elif player.is_playing:
+            player.seek(t)
             self.play_pause_btn.config(text="⏸  Pause")
 
     def _on_seek_drag(self, val: Any) -> None:
@@ -2540,6 +2943,124 @@ class SiftViz(tk.Tk):
         self._render_image()
 
     # ── Viewer: file actions ──────────────────────────────────────────────────
+
+    def _delete_current_media(self) -> None:
+        """Move the currently-viewed file to the system trash and remove its point."""
+        path = self._viewer.current_path
+        if not path:
+            return
+
+        # Stop any active playback first
+        player = self._video_player
+        if player and (player.is_playing or player.is_paused):
+            player.stop()
+            self.play_pause_btn.config(text="▶  Play")
+            self.seek_frame.grid_remove()
+
+        # Move to trash (send2trash → gio trash → warn)
+        try:
+            try:
+                import send2trash  # type: ignore[import]
+                send2trash.send2trash(path)
+            except ImportError:
+                result = subprocess.run(
+                    ["gio", "trash", path], capture_output=True, timeout=5
+                )
+                if result.returncode != 0:
+                    raise RuntimeError(
+                        result.stderr.decode().strip() or "gio trash failed"
+                    )
+            log.info("trashed: %s", path)
+        except Exception as exc:
+            log.warning("could not trash %s: %s", path, exc)
+            self._set_status(f"Could not delete: {exc}", error=True)
+            return
+
+        # Find projection index
+        if self._projection_2d is None:
+            return
+        proj_files = self._projection_2d.get("files", [])
+        if path not in proj_files:
+            return
+        idx = proj_files.index(path)
+
+        # Remove from both projection dicts (in-memory only)
+        for proj in (self._projection_2d, self._projection_3d):
+            if proj is None:
+                continue
+            if idx < len(proj.get("files", [])):
+                proj["files"].pop(idx)
+            if idx < len(proj.get("points", [])):
+                proj["points"].pop(idx)
+
+        # Remove from cluster data, fixing all member indices
+        self._remove_file_from_cluster_data(idx, path)
+
+        # Patch hashes JSON on disk so hot-swap projection/cluster stays consistent
+        if Path(self._hashes_json).exists():
+            try:
+                with open(self._hashes_json) as fh:
+                    hd = json.load(fh)
+                hd.get("files", {}).pop(path, None)
+                with open(self._hashes_json, "w") as fh:
+                    json.dump(hd, fh)
+            except Exception as exc:
+                log.warning("could not patch hashes JSON: %s", exc)
+
+        # Update viewer: navigate away from the deleted file
+        v = self._viewer
+        if path in v.files:
+            removed_at = v.files.index(path)
+            v.files.remove(path)
+            if not v.files:
+                self._clear_viewer()
+                self._selection.clear()
+            else:
+                v.index = min(removed_at, len(v.files) - 1)
+                # Shift selection member indices the same way cluster data was shifted
+                sel = self._selection
+                if sel.member_indices:
+                    sel.member_indices = [
+                        m - (1 if m > idx else 0)
+                        for m in sel.member_indices
+                        if m != idx
+                    ]
+                self._update_viewer()
+
+        # Redraw scatter (point is simply absent from updated data)
+        if self._projection_2d and self._projection_2d.get("files"):
+            self._redraw()
+        else:
+            self._reset_axes()
+            self.canvas.draw()
+
+    def _remove_file_from_cluster_data(self, idx: int, path: str) -> None:
+        """Remove file at *idx* from cluster data, shifting subsequent indices."""
+        cd = self._cluster_data
+        if cd is None:
+            return
+
+        cd_files: list[str] = cd.get("files", [])
+        if idx < len(cd_files):
+            cd_files.pop(idx)
+
+        new_groups = []
+        for g in cd.get("groups", []):
+            new_members = [m - (1 if m > idx else 0) for m in g["members"] if m != idx]
+            if new_members:
+                new_g = dict(g)
+                new_g["members"] = new_members
+                new_g["member_files"] = [
+                    cd_files[m] for m in new_members if m < len(cd_files)
+                ]
+                new_groups.append(new_g)
+        cd["groups"] = new_groups
+
+        cd["ungrouped"] = [
+            m - (1 if m > idx else 0)
+            for m in cd.get("ungrouped", [])
+            if m != idx
+        ]
 
     def _open_media(self) -> None:
         """Open the current file with the system default application."""
