@@ -137,6 +137,8 @@ make run ARGS="project hashes.json --method=pca --dims=3 --output=projection.jso
 make viz
 ```
 
+![sift viz — 3D scatter with media viewer](docs/viz_gui.png)
+
 This opens the visual interface. From left to right:
 
 **Left panel — controls**
@@ -158,6 +160,7 @@ This opens the visual interface. From left to right:
 - **Play** — plays video files inline in the panel (requires ffmpeg)
 - **Open** — opens the file in your system's default application
 - **Folder** — reveals the file in your file manager
+- **Del** — moves the file to the system trash and removes it from the map
 
 ---
 
@@ -199,8 +202,18 @@ sift/
 ├── third_party/
 │   └── stb_image.h           # single-header image decoder
 └── viz/
-    ├── visualize.py          # full interactive visualizer (~1900 lines)
-    └── pyproject.toml        # uv-managed dependencies
+    ├── visualize.py          # entry point shim
+    ├── pyproject.toml        # uv-managed dependencies
+    └── sift_viz/
+        ├── app.py            # SiftViz — main tk.Tk application
+        ├── pipeline.py       # PipelineRunner — hash/project/cluster subprocess threads
+        ├── scatter.py        # ScatterController — matplotlib axes, hit-testing, selection ring
+        ├── player.py         # VideoPlayer — ffmpeg decode + ffplay audio
+        ├── cache.py          # CacheManager — persist results to ~/.cache/sift/
+        ├── models.py         # Pydantic models — HashSettings, ProjectionResult, ClusterResult, …
+        ├── media.py          # media loading, ffprobe helpers, formatting utilities
+        ├── widgets.py        # widget factory functions
+        └── constants.py      # colours, file extensions, capability flags
 ```
 
 ---
