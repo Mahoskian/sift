@@ -6,7 +6,9 @@
 #include "project.hpp"
 #include "threadpool.hpp"
 
+#include <algorithm>
 #include <atomic>
+#include <climits>
 #include <cstdio>
 #include <filesystem>
 #include <iostream>
@@ -29,6 +31,8 @@ static void print_usage() {
         "  sift hash <dir> [options]        Compute perceptual hashes\n"
         "  sift cluster <file> [options]    Cluster hashes by similarity\n"
         "  sift project <file> [options]    Project hashes to 2D/3D/ND\n"
+        "  sift remove <hashes> <path>      Remove a file from hash/cluster/projection JSON\n"
+        "  sift find <hashes> [options]     Find files similar to a query file\n"
         "\n"
         "Hash options:\n"
         "  --algo=<dhash|phash|whash>       Hash algorithm (default: dhash)\n"
@@ -67,7 +71,27 @@ static void print_usage() {
         "\n"
         "Project examples:\n"
         "  sift project hashes.json --method=pca --dims=3\n"
-        "  sift project hashes.json --method=tsne --dims=2 --perplexity=15\n";
+        "  sift project hashes.json --method=tsne --dims=2 --perplexity=15\n"
+        "\n"
+        "Remove options:\n"
+        "  --cluster=<file>                 Also remove from cluster JSON (in-place)\n"
+        "  --projection=<file>              Also remove from projection JSON (in-place)\n"
+        "\n"
+        "Remove examples:\n"
+        "  sift remove hashes.json /path/to/photo.jpg\n"
+        "  sift remove hashes.json /path/to/photo.jpg --cluster=clusters.json --projection=proj.json\n"
+        "\n"
+        "Find options:\n"
+        "  --similar-to=<path>              Query file to find similar matches for (required)\n"
+        "  --top=<N>                        Return at most N results (default: 10, 0=all)\n"
+        "  --threshold=<N>                  Only return matches within hamming distance N\n"
+        "  --format=<text|json>             Output format (default: text)\n"
+        "  --frames=<N>                     Frames to sample if query is a video (default: 8)\n"
+        "\n"
+        "Find examples:\n"
+        "  sift find hashes.json --similar-to=photo.jpg\n"
+        "  sift find hashes.json --similar-to=photo.jpg --top=5 --format=json\n"
+        "  sift find hashes.json --similar-to=video.mp4 --threshold=10 --top=0\n";
 }
 
 // ─── JSON output: hash ──────────────────────────────────────────────────────
@@ -749,6 +773,452 @@ static int cmd_project(int argc, char* argv[]) {
     return 0;
 }
 
+// ─── Helpers for sift remove ────────────────────────────────────────────────
+
+static std::vector<std::vector<int>> dm_remove_entry(
+    const std::vector<std::vector<int>>& dm, int idx)
+{
+    int n = (int)dm.size();
+    std::vector<std::vector<int>> out;
+    out.reserve(n - 1);
+    for (int i = 0; i < n; i++) {
+        if (i == idx) continue;
+        std::vector<int> row;
+        row.reserve(n - 1);
+        for (int j = 0; j < n; j++) {
+            if (j == idx) continue;
+            row.push_back(dm[i][j]);
+        }
+        out.push_back(std::move(row));
+    }
+    return out;
+}
+
+static void recalc_group_stats(GroupInfo& g, const std::vector<std::vector<int>>& dm) {
+    if (g.members.size() <= 1) {
+        g.max_internal_distance = 0;
+        g.avg_internal_distance = 0.0;
+        return;
+    }
+    int max_d = 0;
+    double sum_d = 0.0;
+    int count = 0;
+    for (size_t a = 0; a < g.members.size(); a++) {
+        for (size_t b = a + 1; b < g.members.size(); b++) {
+            int d = dm[g.members[a]][g.members[b]];
+            if (d > max_d) max_d = d;
+            sum_d += d;
+            count++;
+        }
+    }
+    g.max_internal_distance = max_d;
+    g.avg_internal_distance = count > 0 ? sum_d / count : 0.0;
+}
+
+static void write_updated_cluster_json(std::ostream& out, const io::ParsedCluster& c) {
+    int n = (int)c.files.size();
+
+    out << "{\n";
+    out << "  \"algorithm\": \"" << c.algorithm << "\",\n";
+    out << "  \"hash_size\": " << c.hash_size << ",\n";
+    out << "  \"hash_bits\": " << c.hash_bits << ",\n";
+    out << "  \"method\": \"" << c.method << "\",\n";
+    out << "  \"params\": " << c.raw_params << ",\n";
+
+    out << "  \"files\": [";
+    for (int i = 0; i < n; i++) {
+        out << "\"" << c.files[i] << "\"";
+        if (i + 1 < n) out << ", ";
+    }
+    out << "],\n";
+
+    out << "  \"distance_matrix\": [\n";
+    for (int i = 0; i < n; i++) {
+        out << "    [";
+        for (int j = 0; j < n; j++) {
+            out << c.distance_matrix[i][j];
+            if (j + 1 < n) out << ", ";
+        }
+        out << "]";
+        if (i + 1 < n) out << ",";
+        out << "\n";
+    }
+    out << "  ],\n";
+
+    if (c.has_membership) {
+        out << "  \"membership\": [\n";
+        for (size_t i = 0; i < c.membership.size(); i++) {
+            auto& m = c.membership[i];
+            out << "    {\"file\": " << m.file
+                << ", \"group\": " << m.group
+                << ", \"confidence\": " << m.confidence << "}";
+            if (i + 1 < c.membership.size()) out << ",";
+            out << "\n";
+        }
+        out << "  ],\n";
+    }
+
+    out << "  \"groups\": [\n";
+    for (size_t i = 0; i < c.groups.size(); i++) {
+        auto& g = c.groups[i];
+        out << "    {\n";
+        out << "      \"id\": " << g.id << ",\n";
+        out << "      \"members\": [";
+        for (size_t j = 0; j < g.members.size(); j++) {
+            out << g.members[j];
+            if (j + 1 < g.members.size()) out << ", ";
+        }
+        out << "],\n";
+        out << "      \"member_files\": [";
+        for (size_t j = 0; j < g.members.size(); j++) {
+            out << "\"" << c.files[g.members[j]] << "\"";
+            if (j + 1 < g.members.size()) out << ", ";
+        }
+        out << "],\n";
+        out << "      \"max_internal_distance\": " << g.max_internal_distance << ",\n";
+        out << "      \"avg_internal_distance\": " << g.avg_internal_distance << "\n";
+        out << "    }";
+        if (i + 1 < c.groups.size()) out << ",";
+        out << "\n";
+    }
+    out << "  ],\n";
+
+    out << "  \"ungrouped\": [";
+    for (size_t i = 0; i < c.ungrouped.size(); i++) {
+        out << c.ungrouped[i];
+        if (i + 1 < c.ungrouped.size()) out << ", ";
+    }
+    out << "],\n";
+
+    // Recalculate stats from updated distance matrix
+    int min_d = (n > 1) ? INT_MAX : 0, max_d = 0;
+    double sum_d = 0.0;
+    long long count = 0;
+    for (int i = 0; i < n; i++) {
+        for (int j = i + 1; j < n; j++) {
+            int d = c.distance_matrix[i][j];
+            if (d < min_d) min_d = d;
+            if (d > max_d) max_d = d;
+            sum_d += d;
+            count++;
+        }
+    }
+    if (n <= 1) min_d = 0;
+    double avg_d = count > 0 ? sum_d / count : 0.0;
+
+    out << "  \"stats\": {\n";
+    out << "    \"total_files\": " << n << ",\n";
+    out << "    \"total_groups\": " << c.groups.size() << ",\n";
+    out << "    \"total_ungrouped\": " << c.ungrouped.size() << ",\n";
+    out << "    \"min_distance\": " << min_d << ",\n";
+    out << "    \"max_distance\": " << max_d << ",\n";
+    out << "    \"avg_distance\": " << avg_d << "\n";
+    out << "  }\n";
+    out << "}\n";
+}
+
+static void write_updated_project_json(std::ostream& out, const io::ParsedProjection& p) {
+    int n = (int)p.files.size();
+    out << "{\n";
+    out << "  \"algorithm\": \"" << p.algorithm << "\",\n";
+    out << "  \"hash_size\": " << p.hash_size << ",\n";
+    out << "  \"hash_bits\": " << p.hash_bits << ",\n";
+    out << "  \"method\": \"" << p.method << "\",\n";
+    out << "  \"dims\": " << p.dims << ",\n";
+
+    out << "  \"files\": [";
+    for (int i = 0; i < n; i++) {
+        out << "\"" << p.files[i] << "\"";
+        if (i + 1 < n) out << ", ";
+    }
+    out << "],\n";
+
+    out << "  \"points\": [\n";
+    for (int i = 0; i < n; i++) {
+        out << "    [";
+        for (int d = 0; d < p.dims && d < (int)p.points[i].size(); d++) {
+            out << p.points[i][d];
+            if (d + 1 < p.dims && d + 1 < (int)p.points[i].size()) out << ", ";
+        }
+        out << "]";
+        if (i + 1 < n) out << ",";
+        out << "\n";
+    }
+    out << "  ]";
+
+    if (!p.variance_explained.empty()) {
+        out << ",\n  \"variance_explained\": [";
+        for (size_t i = 0; i < p.variance_explained.size(); i++) {
+            out << p.variance_explained[i];
+            if (i + 1 < p.variance_explained.size()) out << ", ";
+        }
+        out << "]";
+    }
+
+    out << "\n}\n";
+}
+
+// ─── Subcommand: remove ──────────────────────────────────────────────────────
+
+static int cmd_remove(int argc, char* argv[]) {
+    std::string hashes_file;
+    std::string file_path;
+    std::string cluster_file;
+    std::string proj_file;
+
+    static struct option long_opts[] = {
+        {"cluster",    required_argument, 0, 'c'},
+        {"projection", required_argument, 0, 'p'},
+        {"help",       no_argument,       0, 'h'},
+        {0, 0, 0, 0}
+    };
+
+    optind = 1;
+    int opt;
+    while ((opt = getopt_long(argc, argv, "c:p:h", long_opts, nullptr)) != -1) {
+        switch (opt) {
+            case 'c': cluster_file = optarg; break;
+            case 'p': proj_file    = optarg; break;
+            case 'h': print_usage(); return 0;
+            default:  print_usage(); return 1;
+        }
+    }
+
+    if (optind < argc) hashes_file = argv[optind++];
+    if (optind < argc) file_path   = argv[optind];
+
+    if (hashes_file.empty() || file_path.empty()) {
+        std::cerr << "sift: remove requires <hashes_file> and <file_path>\n";
+        return 1;
+    }
+    if (hashes_file == "-") {
+        std::cerr << "sift: remove does not support stdin (files must be named)\n";
+        return 1;
+    }
+
+    // ── 1. Update hashes.json ───────────────────────────────────────────────
+
+    ClusterInput input = io::parse_hash_json(io::read_file(hashes_file));
+    auto it = std::find(input.files.begin(), input.files.end(), file_path);
+    if (it == input.files.end()) {
+        std::cerr << "sift: file not found in hashes: " << file_path << "\n";
+        return 1;
+    }
+    int file_idx = (int)(it - input.files.begin());
+    input.files.erase(input.files.begin() + file_idx);
+    input.hashes.erase(input.hashes.begin() + file_idx);
+
+    {
+        std::vector<std::pair<std::string, HashResult>> pairs;
+        pairs.reserve(input.files.size());
+        for (size_t i = 0; i < input.files.size(); i++)
+            pairs.push_back({input.files[i], input.hashes[i]});
+        std::ofstream ofs(hashes_file);
+        if (!ofs) { std::cerr << "sift: cannot write: " << hashes_file << "\n"; return 1; }
+        write_hash_json(ofs, input.algorithm, input.hash_size, pairs);
+    }
+    std::cerr << "sift: removed '" << file_path << "' from " << hashes_file << "\n";
+
+    // ── 2. Update cluster JSON (optional) ───────────────────────────────────
+
+    if (!cluster_file.empty()) {
+        io::ParsedCluster c = io::parse_cluster_json(io::read_file(cluster_file));
+
+        auto cit = std::find(c.files.begin(), c.files.end(), file_path);
+        if (cit == c.files.end()) {
+            std::cerr << "sift: warning: file not in cluster JSON, skipping cluster update\n";
+        } else {
+            int cidx = (int)(cit - c.files.begin());
+            c.files.erase(c.files.begin() + cidx);
+            c.distance_matrix = dm_remove_entry(c.distance_matrix, cidx);
+
+            std::vector<GroupInfo> kept_groups;
+            std::vector<int> newly_ungrouped;
+
+            for (auto& g : c.groups) {
+                std::vector<int> nm;
+                for (int m : g.members) {
+                    if (m == cidx) continue;
+                    nm.push_back(m > cidx ? m - 1 : m);
+                }
+                if (nm.size() >= 2) {
+                    g.members = std::move(nm);
+                    recalc_group_stats(g, c.distance_matrix);
+                    kept_groups.push_back(std::move(g));
+                } else if (nm.size() == 1) {
+                    newly_ungrouped.push_back(nm[0]);
+                }
+                // size == 0: group dissolved entirely, nothing to save
+            }
+            c.groups = std::move(kept_groups);
+
+            {
+                std::vector<int> new_ung;
+                for (int u : c.ungrouped) {
+                    if (u == cidx) continue;
+                    new_ung.push_back(u > cidx ? u - 1 : u);
+                }
+                for (int u : newly_ungrouped) new_ung.push_back(u);
+                c.ungrouped = std::move(new_ung);
+            }
+
+            if (c.has_membership) {
+                std::vector<MembershipInfo> nm;
+                for (auto& m : c.membership) {
+                    if (m.file == cidx) continue;
+                    if (m.file > cidx) m.file--;
+                    nm.push_back(m);
+                }
+                c.membership = std::move(nm);
+            }
+
+            std::ofstream ofs(cluster_file);
+            if (!ofs) { std::cerr << "sift: cannot write: " << cluster_file << "\n"; return 1; }
+            write_updated_cluster_json(ofs, c);
+            std::cerr << "sift: updated cluster JSON: " << cluster_file << "\n";
+        }
+    }
+
+    // ── 3. Update projection JSON (optional) ────────────────────────────────
+
+    if (!proj_file.empty()) {
+        io::ParsedProjection p = io::parse_project_json(io::read_file(proj_file));
+
+        auto pit = std::find(p.files.begin(), p.files.end(), file_path);
+        if (pit == p.files.end()) {
+            std::cerr << "sift: warning: file not in projection JSON, skipping projection update\n";
+        } else {
+            int pidx = (int)(pit - p.files.begin());
+            p.files.erase(p.files.begin() + pidx);
+            if (pidx < (int)p.points.size())
+                p.points.erase(p.points.begin() + pidx);
+
+            std::ofstream ofs(proj_file);
+            if (!ofs) { std::cerr << "sift: cannot write: " << proj_file << "\n"; return 1; }
+            write_updated_project_json(ofs, p);
+            std::cerr << "sift: updated projection JSON: " << proj_file << "\n";
+        }
+    }
+
+    return 0;
+}
+
+// ─── Subcommand: find ────────────────────────────────────────────────────────
+
+static bool is_video_path(const std::string& path) {
+    std::string ext = std::filesystem::path(path).extension().string();
+    std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+    for (auto* e : {".mp4", ".mkv", ".avi", ".mov", ".webm", ".m4v", ".ts", ".flv", ".wmv"})
+        if (ext == e) return true;
+    return false;
+}
+
+static int cmd_find(int argc, char* argv[]) {
+    std::string hashes_file;
+    std::string query_path;
+    int top_n     = 10;
+    int threshold = -1;
+    std::string format = "text";
+    int n_frames  = 8;
+
+    static struct option long_opts[] = {
+        {"similar-to", required_argument, 0, 'q'},
+        {"top",        required_argument, 0, 'n'},
+        {"threshold",  required_argument, 0, 'T'},
+        {"format",     required_argument, 0, 'f'},
+        {"frames",     required_argument, 0, 'F'},
+        {"help",       no_argument,       0, 'h'},
+        {0, 0, 0, 0}
+    };
+
+    optind = 1;
+    int opt;
+    while ((opt = getopt_long(argc, argv, "q:n:T:f:F:h", long_opts, nullptr)) != -1) {
+        switch (opt) {
+            case 'q': query_path = optarg; break;
+            case 'n': top_n      = std::stoi(optarg); break;
+            case 'T': threshold  = std::stoi(optarg); break;
+            case 'f': format     = optarg; break;
+            case 'F': n_frames   = std::stoi(optarg); break;
+            case 'h': print_usage(); return 0;
+            default:  print_usage(); return 1;
+        }
+    }
+
+    if (optind < argc) hashes_file = argv[optind];
+
+    if (hashes_file.empty()) {
+        std::cerr << "sift: no hash file specified\n";
+        return 1;
+    }
+    if (query_path.empty()) {
+        std::cerr << "sift: --similar-to=<path> is required\n";
+        return 1;
+    }
+    if (format != "text" && format != "json") {
+        std::cerr << "sift: --format must be text or json\n";
+        return 1;
+    }
+
+    ClusterInput input = io::parse_hash_json(io::read_file(hashes_file));
+    int n = (int)input.files.size();
+    std::cerr << "sift: loaded " << n << " hashes ("
+              << input.algorithm << " " << input.hash_size << "x" << input.hash_size << ")\n";
+
+    HashFn hash_fn;
+    if      (input.algorithm == "dhash") hash_fn = dhash;
+    else if (input.algorithm == "phash") hash_fn = phash;
+    else if (input.algorithm == "whash") hash_fn = whash;
+    else {
+        std::cerr << "sift: unknown algorithm in hash file: " << input.algorithm << "\n";
+        return 1;
+    }
+
+    // Hash the query file
+    HashResult query_hash;
+    if (is_video_path(query_path)) {
+        auto frame_src = io::make_frame_source("evenly_spaced", n_frames);
+        query_hash = hash_video(std::filesystem::path(query_path), *frame_src, hash_fn, input.hash_size);
+    } else {
+        query_hash = hash_fn(query_path, input.hash_size);
+    }
+
+    if (query_hash.bits.empty()) {
+        std::cerr << "sift: failed to hash query file: " << query_path << "\n";
+        return 1;
+    }
+
+    // Compute distances to all files in dataset
+    std::vector<std::pair<int, int>> matches; // (distance, file_idx)
+    matches.reserve(n);
+    for (int i = 0; i < n; i++) {
+        int d = HashResult::hamming(query_hash, input.hashes[i]);
+        if (threshold < 0 || d <= threshold)
+            matches.push_back({d, i});
+    }
+
+    std::sort(matches.begin(), matches.end());
+
+    if (top_n > 0 && (int)matches.size() > top_n)
+        matches.resize(top_n);
+
+    if (format == "json") {
+        std::cout << "[\n";
+        for (size_t i = 0; i < matches.size(); i++) {
+            std::cout << "  {\"file\": \"" << input.files[matches[i].second]
+                      << "\", \"distance\": " << matches[i].first << "}";
+            if (i + 1 < matches.size()) std::cout << ",";
+            std::cout << "\n";
+        }
+        std::cout << "]\n";
+    } else {
+        for (auto& [d, idx] : matches)
+            std::cout << d << "\t" << input.files[idx] << "\n";
+    }
+
+    return 0;
+}
+
 // ─── Main ───────────────────────────────────────────────────────────────────
 
 int main(int argc, char* argv[]) {
@@ -770,6 +1240,8 @@ int main(int argc, char* argv[]) {
     if (subcommand == "hash")    return cmd_hash(argc, argv);
     if (subcommand == "cluster") return cmd_cluster(argc, argv);
     if (subcommand == "project") return cmd_project(argc, argv);
+    if (subcommand == "remove")  return cmd_remove(argc, argv);
+    if (subcommand == "find")    return cmd_find(argc, argv);
 
     std::cerr << "sift: unknown command '" << subcommand << "'\n";
     print_usage();

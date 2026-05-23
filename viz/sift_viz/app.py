@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-import json
 import logging
 import queue
 import shutil
 import signal
+import subprocess
 import sys
 import tempfile
 import threading
@@ -1313,8 +1313,6 @@ class SiftViz(tk.Tk):
 
                 send2trash.send2trash(path)
             except ImportError:
-                import subprocess
-
                 result = subprocess.run(["gio", "trash", path], capture_output=True, timeout=5)
                 if result.returncode != 0:
                     msg = result.stderr.decode().strip() or "gio trash failed"
@@ -1345,13 +1343,14 @@ class SiftViz(tk.Tk):
 
         # Patch hashes JSON on disk so hot-swap stays consistent
         hashes_path = Path(self.tmpdir) / "hashes.json"
-        if hashes_path.exists():
+        if hashes_path.exists() and self._pipeline:
             try:
-                with open(hashes_path) as fh:
-                    hd = json.load(fh)
-                hd.get("files", {}).pop(path, None)
-                with open(hashes_path, "w") as fh:
-                    json.dump(hd, fh)
+                result = subprocess.run(
+                    [self._pipeline.binary, "remove", str(hashes_path), path],
+                    capture_output=True, timeout=10,
+                )
+                if result.returncode != 0:
+                    log.warning("sift remove failed: %s", result.stderr.decode().strip())
             except Exception as exc:
                 log.warning("could not patch hashes JSON: %s", exc)
 
