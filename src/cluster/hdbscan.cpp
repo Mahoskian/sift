@@ -1,4 +1,5 @@
 #include "cluster.hpp"
+#include "parallel.hpp"
 
 #include <vector>
 #include <algorithm>
@@ -83,57 +84,39 @@ struct CNode {
     int child_size;
 };
 
-static GroupInfo make_hdbscan_group(int id, const std::vector<int>& members, const DistanceMatrix& dm) {
-    GroupInfo g;
-    g.id = id;
-    g.members = members;
-    g.max_internal_distance = 0;
-    g.avg_internal_distance = 0.0;
-
-    if (members.size() > 1) {
-        long long sum = 0;
-        long long count = 0;
-        for (size_t i = 0; i < members.size(); i++) {
-            for (size_t j = i + 1; j < members.size(); j++) {
-                int d = dm.get(members[i], members[j]);
-                g.max_internal_distance = std::max(g.max_internal_distance, d);
-                sum += d;
-                count++;
-            }
-        }
-        g.avg_internal_distance = (double)sum / count;
-    }
-
-    return g;
-}
-
-HdbscanResult hdbscan_cluster(const DistanceMatrix& dm, int min_cluster_size) {
+HdbscanResult hdbscan_cluster(const DistanceMatrix& dm, int min_cluster_size,
+                              int num_threads) {
     int n = dm.n;
+
+    ThreadPool pool(num_threads);
 
     // 1. Core distances: for each point, distance to its (min_cluster_size-1)-th
     //    nearest neighbor (k-th nearest, 0-indexed, excluding self)
     int k = std::min(min_cluster_size - 1, n - 1);
     if (k < 1) k = 1;
 
+    // Each point sorts its own row, so this parallelises cleanly — and it is
+    // the O(n^2 log n) step, the most expensive part of the whole algorithm.
     std::vector<int> core_dist(n);
-    for (int i = 0; i < n; i++) {
+    parallel_for(pool, n, [&](int i) {
         std::vector<int> dists;
         dists.reserve(n - 1);
         for (int j = 0; j < n; j++)
             if (i != j) dists.push_back(dm.get(i, j));
         std::sort(dists.begin(), dists.end());
         core_dist[i] = dists[std::min(k - 1, (int)dists.size() - 1)];
-    }
+    });
 
     // 2. Mutual reachability graph
     //    mr_dist(a, b) = max(core_dist[a], core_dist[b], dist(a, b))
     std::vector<std::vector<int>> mr_graph(n, std::vector<int>(n, 0));
-    for (int i = 0; i < n; i++)
+    parallel_for(pool, n, [&](int i) {
         for (int j = i + 1; j < n; j++) {
             int d = std::max({core_dist[i], core_dist[j], dm.get(i, j)});
             mr_graph[i][j] = d;
             mr_graph[j][i] = d;
         }
+    });
 
     // 3. Minimum spanning tree
     auto mst = mst_prim(mr_graph, n);
@@ -484,10 +467,7 @@ HdbscanResult hdbscan_cluster(const DistanceMatrix& dm, int min_cluster_size) {
             group_members[gid].push_back(i);
     }
 
-    for (int g = 0; g < num_groups; g++) {
-        std::sort(group_members[g].begin(), group_members[g].end());
-        result.groups.push_back(make_hdbscan_group(g, group_members[g], dm));
-    }
+    result.groups = build_groups(group_members, dm, pool);
 
     // Condensed tree output
     result.condensed_tree.clear();

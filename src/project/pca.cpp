@@ -1,5 +1,7 @@
 #include "project.hpp"
+#include "parallel.hpp"
 
+#include <atomic>
 #include <cmath>
 #include <algorithm>
 #include <numeric>
@@ -13,21 +15,39 @@ struct EigenResult {
     std::vector<std::vector<double>> vectors;  // vectors[i] = i-th eigenvector
 };
 
-static EigenResult jacobi_eigen(std::vector<std::vector<double>> A, int n, int max_iter = 200) {
+static EigenResult jacobi_eigen(std::vector<std::vector<double>> A, int n,
+                                ThreadPool& pool, int max_iter = 200) {
     // Initialize eigenvectors as identity
     std::vector<std::vector<double>> V(n, std::vector<double>(n, 0.0));
     for (int i = 0; i < n; i++) V[i][i] = 1.0;
 
+    // Per-row pivot candidates for the search below, allocated once.
+    std::vector<int> row_q(n);
+    std::vector<double> row_val(n);
+
     for (int iter = 0; iter < max_iter; iter++) {
-        // Find largest off-diagonal element
+        // Find largest off-diagonal element. Each row picks its own candidate
+        // in parallel; the reduction then scans rows in ascending order with
+        // the same strict > as the serial search, so the chosen pivot — and
+        // therefore the whole rotation sequence — is identical either way.
+        parallel_for(pool, n, [&](int i) {
+            row_val[i] = 0.0;
+            row_q[i] = -1;
+            for (int j = i + 1; j < n; j++) {
+                double v = std::abs(A[i][j]);
+                if (v > row_val[i]) {
+                    row_val[i] = v;
+                    row_q[i] = j;
+                }
+            }
+        }, 64);
+
         int p = 0, q = 1;
         double max_val = 0.0;
         for (int i = 0; i < n; i++) {
-            for (int j = i + 1; j < n; j++) {
-                if (std::abs(A[i][j]) > max_val) {
-                    max_val = std::abs(A[i][j]);
-                    p = i; q = j;
-                }
+            if (row_q[i] >= 0 && row_val[i] > max_val) {
+                max_val = row_val[i];
+                p = i; q = row_q[i];
             }
         }
 
@@ -108,7 +128,7 @@ std::vector<std::vector<double>> hashes_to_features(
 
 ProjectionResult pca_project(
     const std::vector<std::vector<double>>& features, int dims,
-    std::function<void(int,int)> progress_cb)
+    int num_threads, std::function<void(int,int)> progress_cb)
 {
     int n = (int)features.size();
     int d = n > 0 ? (int)features[0].size() : 0;
@@ -128,8 +148,11 @@ ProjectionResult pca_project(
 
     // Dual PCA: compute Gram matrix G = X * X^T (n x n)
     // Much smaller than covariance matrix when n << d
+    ThreadPool pool(num_threads);
+    std::atomic<int> rows_done{0};
+
     std::vector<std::vector<double>> G(n, std::vector<double>(n, 0.0));
-    for (int i = 0; i < n; i++) {
+    parallel_for(pool, n, [&](int i) {
         for (int j = i; j < n; j++) {
             double dot = 0.0;
             for (int f = 0; f < d; f++)
@@ -137,11 +160,12 @@ ProjectionResult pca_project(
             G[i][j] = dot;
             G[j][i] = dot;
         }
-        if (progress_cb) progress_cb(i + 1, n);
-    }
+        int done = ++rows_done;
+        if (progress_cb) progress_cb(done, n);
+    });
 
     // Eigendecomposition of G
-    auto eigen = jacobi_eigen(G, n);
+    auto eigen = jacobi_eigen(G, n, pool);
 
     // PC scores: Z[i][k] = eigenvector_k[i] * sqrt(eigenvalue_k)
     // (the i-th sample's coordinate on the k-th principal component)

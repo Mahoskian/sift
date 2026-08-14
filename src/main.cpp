@@ -67,6 +67,7 @@ static void print_usage() {
         "  --perplexity=<N>                 t-SNE perplexity (default: 30)\n"
         "  --iterations=<N>                 t-SNE max iterations (default: 1000)\n"
         "  --learning-rate=<N>              t-SNE learning rate (default: 200)\n"
+        "  --threads=<N>                    Thread count (default: CPU cores)\n"
         "  --output=<file>                  Output JSON file (default: stdout)\n"
         "\n"
         "Project examples:\n"
@@ -557,18 +558,18 @@ static int cmd_cluster(int argc, char* argv[]) {
     HdbscanResult hdbscan_result;
 
     if (method == "threshold") {
-        groups = threshold_cluster(dm, threshold);
+        groups = threshold_cluster(dm, threshold, num_threads);
         params.push_back({"threshold", std::to_string(threshold)});
 
     } else if (method == "hierarchical") {
-        hier_result = hierarchical_cluster(dm, cut_height, linkage);
+        hier_result = hierarchical_cluster(dm, cut_height, linkage, num_threads);
         groups = hier_result.groups;
         dendrogram_ptr = &hier_result.dendrogram;
         params.push_back({"linkage", "\"" + linkage + "\""});
         params.push_back({"cut_height", std::to_string(cut_height)});
 
     } else if (method == "hdbscan") {
-        hdbscan_result = hdbscan_cluster(dm, min_group);
+        hdbscan_result = hdbscan_cluster(dm, min_group, num_threads);
         groups = hdbscan_result.groups;
         membership_ptr = &hdbscan_result.membership;
         condensed_tree_ptr = &hdbscan_result.condensed_tree;
@@ -666,6 +667,7 @@ static int cmd_project(int argc, char* argv[]) {
     double perplexity = 30.0;
     int iterations = 1000;
     double learning_rate = 200.0;
+    int num_threads = (int)std::thread::hardware_concurrency();
     std::string output_file;
 
     static struct option long_opts[] = {
@@ -674,6 +676,7 @@ static int cmd_project(int argc, char* argv[]) {
         {"perplexity",    required_argument, 0, 'p'},
         {"iterations",    required_argument, 0, 'i'},
         {"learning-rate", required_argument, 0, 'r'},
+        {"threads",       required_argument, 0, 't'},
         {"output",        required_argument, 0, 'o'},
         {"help",          no_argument,       0, 'h'},
         {0, 0, 0, 0}
@@ -681,13 +684,14 @@ static int cmd_project(int argc, char* argv[]) {
 
     optind = 1;
     int opt;
-    while ((opt = getopt_long(argc, argv, "m:d:p:i:r:o:h", long_opts, nullptr)) != -1) {
+    while ((opt = getopt_long(argc, argv, "m:d:p:i:r:t:o:h", long_opts, nullptr)) != -1) {
         switch (opt) {
             case 'm': method = optarg; break;
             case 'd': dims = std::stoi(optarg); break;
             case 'p': perplexity = std::stod(optarg); break;
             case 'i': iterations = std::stoi(optarg); break;
             case 'r': learning_rate = std::stod(optarg); break;
+            case 't': num_threads = std::stoi(optarg); break;
             case 'o': output_file = optarg; break;
             case 'h': print_usage(); return 0;
             default:  print_usage(); return 1;
@@ -704,6 +708,7 @@ static int cmd_project(int argc, char* argv[]) {
         std::cerr << "sift: dims must be >= 1\n";
         return 1;
     }
+    if (num_threads < 1) num_threads = 1;
 
     // Read and parse hash JSON
     std::cerr << "sift: reading hashes from "
@@ -724,15 +729,20 @@ static int cmd_project(int argc, char* argv[]) {
     // Run projection
     auto t_start = std::chrono::steady_clock::now();
 
+    // Both projections report progress from worker threads, so serialise the
+    // writes the way the distance-matrix callback does.
+    std::mutex proj_prog_mtx;
+    auto proj_progress = [&](int done, int total) {
+        char buf[80];
+        int len = std::snprintf(buf, sizeof(buf), "sift: progress %d/%d\n", done, total);
+        std::lock_guard<std::mutex> lk(proj_prog_mtx);
+        std::fwrite(buf, 1, static_cast<size_t>(len), stderr);
+        std::fflush(stderr);
+    };
+
     ProjectionResult proj;
     if (method == "pca") {
-        auto pca_cb = [](int row, int total) {
-            char buf[80];
-            int len = std::snprintf(buf, sizeof(buf), "sift: progress %d/%d\n", row, total);
-            std::fwrite(buf, 1, static_cast<size_t>(len), stderr);
-            std::fflush(stderr);
-        };
-        proj = pca_project(features, dims, pca_cb);
+        proj = pca_project(features, dims, num_threads, proj_progress);
         std::cerr << "sift: PCA variance explained:";
         for (int d = 0; d < proj.dims; d++)
             std::cerr << " " << (proj.variance_explained[d] * 100.0) << "%";
@@ -741,13 +751,8 @@ static int cmd_project(int argc, char* argv[]) {
         std::cerr << "sift: running t-SNE (dims=" << dims
                   << ", perplexity=" << perplexity
                   << ", iterations=" << iterations << ")\n";
-        auto tsne_cb = [](int iter, int total) {
-            char buf[80];
-            int len = std::snprintf(buf, sizeof(buf), "sift: progress %d/%d\n", iter, total);
-            std::fwrite(buf, 1, static_cast<size_t>(len), stderr);
-            std::fflush(stderr);
-        };
-        proj = tsne_project(features, dims, perplexity, iterations, learning_rate, tsne_cb);
+        proj = tsne_project(features, dims, perplexity, iterations, learning_rate,
+                            num_threads, proj_progress);
     } else {
         std::cerr << "sift: unknown method '" << method << "'\n";
         return 1;

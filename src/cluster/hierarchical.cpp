@@ -1,4 +1,5 @@
 #include "cluster.hpp"
+#include "parallel.hpp"
 
 #include <vector>
 #include <algorithm>
@@ -48,32 +49,9 @@ static int average_linkage(const std::vector<int>& a, const std::vector<int>& b,
 
 using LinkageFn = int(*)(const std::vector<int>&, const std::vector<int>&, const DistanceMatrix&);
 
-static GroupInfo make_group_from(int id, const std::vector<int>& members, const DistanceMatrix& dm) {
-    GroupInfo g;
-    g.id = id;
-    g.members = members;
-    g.max_internal_distance = 0;
-    g.avg_internal_distance = 0.0;
-
-    if (members.size() > 1) {
-        long long sum = 0;
-        long long count = 0;
-        for (size_t i = 0; i < members.size(); i++) {
-            for (size_t j = i + 1; j < members.size(); j++) {
-                int d = dm.get(members[i], members[j]);
-                g.max_internal_distance = std::max(g.max_internal_distance, d);
-                sum += d;
-                count++;
-            }
-        }
-        g.avg_internal_distance = (double)sum / count;
-    }
-
-    return g;
-}
-
 HierarchicalResult hierarchical_cluster(
-    const DistanceMatrix& dm, int cut_height, const std::string& linkage)
+    const DistanceMatrix& dm, int cut_height, const std::string& linkage,
+    int num_threads)
 {
     int n = dm.n;
 
@@ -89,22 +67,39 @@ HierarchicalResult hierarchical_cluster(
     std::vector<bool> active(n, true);
     std::vector<DendrogramStep> dendrogram;
 
+    ThreadPool pool(num_threads);
+
+    // Per-row winner of the closest-pair scan, reused across every merge step.
+    std::vector<int> row_j(n);
+    std::vector<int> row_dist(n);
+
     // N-1 merges to build the full tree
     for (int step = 0; step < n - 1; step++) {
-        // Find closest pair of active clusters
-        int best_i = -1, best_j = -1;
-        int best_dist = std::numeric_limits<int>::max();
-
-        for (int i = 0; i < (int)clusters.size(); i++) {
-            if (!active[i]) continue;
-            for (int j = i + 1; j < (int)clusters.size(); j++) {
+        // Find closest pair of active clusters. Each row i scans only j > i and
+        // records its own best, so rows never contend; the winners are then
+        // reduced in ascending i with the same strict < the serial scan used,
+        // which reproduces its exact tie-breaking (lowest i, then lowest j).
+        parallel_for(pool, n, [&](int i) {
+            row_dist[i] = std::numeric_limits<int>::max();
+            row_j[i] = -1;
+            if (!active[i]) return;
+            for (int j = i + 1; j < n; j++) {
                 if (!active[j]) continue;
                 int d = link_fn(clusters[i], clusters[j], dm);
-                if (d < best_dist) {
-                    best_dist = d;
-                    best_i = i;
-                    best_j = j;
+                if (d < row_dist[i]) {
+                    row_dist[i] = d;
+                    row_j[i] = j;
                 }
+            }
+        }, 8);
+
+        int best_i = -1, best_j = -1;
+        int best_dist = std::numeric_limits<int>::max();
+        for (int i = 0; i < n; i++) {
+            if (row_j[i] >= 0 && row_dist[i] < best_dist) {
+                best_dist = row_dist[i];
+                best_i = i;
+                best_j = row_j[i];
             }
         }
 
@@ -148,13 +143,10 @@ HierarchicalResult hierarchical_cluster(
     HierarchicalResult result;
     result.dendrogram = dendrogram;
 
-    int gid = 0;
-    for (int i = 0; i < (int)cut_clusters.size(); i++) {
-        if (!cut_active[i]) continue;
-        auto& members = cut_clusters[i];
-        std::sort(members.begin(), members.end());
-        result.groups.push_back(make_group_from(gid++, members, dm));
-    }
+    std::vector<std::vector<int>> surviving;
+    for (int i = 0; i < (int)cut_clusters.size(); i++)
+        if (cut_active[i]) surviving.push_back(std::move(cut_clusters[i]));
 
+    result.groups = build_groups(surviving, dm, pool);
     return result;
 }

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "hash.hpp"
+#include "threadpool.hpp"
 
 #include <functional>
 #include <string>
@@ -46,6 +47,15 @@ struct GroupInfo {
     double avg_internal_distance;
 };
 
+// Turns member lists into GroupInfo, sorting each list and filling in its
+// internal distance stats. Those stats are O(|group|^2), so a single dominant
+// group costs as much as the whole distance matrix — the groups are built in
+// parallel on the caller's pool. IDs are the member lists' own indices.
+std::vector<GroupInfo> build_groups(
+    const std::vector<std::vector<int>>& members,
+    const DistanceMatrix& dm,
+    ThreadPool& pool);
+
 // --- Dendrogram (hierarchical) ---
 
 struct DendrogramStep {
@@ -73,7 +83,7 @@ struct CondensedTreeNode {
 // --- Clustering algorithms ---
 
 std::vector<GroupInfo> threshold_cluster(
-    const DistanceMatrix& dm, int threshold);
+    const DistanceMatrix& dm, int threshold, int num_threads = 1);
 
 struct HierarchicalResult {
     std::vector<GroupInfo> groups;
@@ -82,7 +92,8 @@ struct HierarchicalResult {
 
 HierarchicalResult hierarchical_cluster(
     const DistanceMatrix& dm, int cut_height,
-    const std::string& linkage = "complete");
+    const std::string& linkage = "complete",
+    int num_threads = 1);
 
 struct HdbscanResult {
     std::vector<GroupInfo> groups;
@@ -91,4 +102,4 @@ struct HdbscanResult {
 };
 
 HdbscanResult hdbscan_cluster(
-    const DistanceMatrix& dm, int min_cluster_size);
+    const DistanceMatrix& dm, int min_cluster_size, int num_threads = 1);

@@ -21,9 +21,11 @@ std::vector<std::vector<double>> hashes_to_features(
 
 // PCA: project into top-k dimensions.
 // Uses dual PCA (Gram matrix) — efficient when n_samples << n_features.
+// progress_cb is invoked from worker threads and must be thread-safe.
 ProjectionResult pca_project(
     const std::vector<std::vector<double>>& features,
     int dims,
+    int num_threads = 1,
     std::function<void(int,int)> progress_cb = nullptr);
 
 // t-SNE: project into dims dimensions.
@@ -36,4 +38,5 @@ ProjectionResult tsne_project(
     double perplexity = 30.0,
     int max_iter = 1000,
     double learning_rate = 200.0,
+    int num_threads = 1,
     std::function<void(int,int)> progress_cb = nullptr);

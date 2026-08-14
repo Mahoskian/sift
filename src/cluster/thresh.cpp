@@ -29,31 +29,8 @@ struct UnionFind {
     }
 };
 
-static GroupInfo make_group(int id, const std::vector<int>& members, const DistanceMatrix& dm) {
-    GroupInfo g;
-    g.id = id;
-    g.members = members;
-    g.max_internal_distance = 0;
-    g.avg_internal_distance = 0.0;
-
-    if (members.size() > 1) {
-        long long sum = 0;
-        long long count = 0;
-        for (size_t i = 0; i < members.size(); i++) {
-            for (size_t j = i + 1; j < members.size(); j++) {
-                int d = dm.get(members[i], members[j]);
-                g.max_internal_distance = std::max(g.max_internal_distance, d);
-                sum += d;
-                count++;
-            }
-        }
-        g.avg_internal_distance = (double)sum / count;
-    }
-
-    return g;
-}
-
-std::vector<GroupInfo> threshold_cluster(const DistanceMatrix& dm, int threshold) {
+std::vector<GroupInfo> threshold_cluster(const DistanceMatrix& dm, int threshold,
+                                         int num_threads) {
     int n = dm.n;
     UnionFind uf(n);
 
@@ -77,12 +54,6 @@ std::vector<GroupInfo> threshold_cluster(const DistanceMatrix& dm, int threshold
     }
 
     // Build GroupInfo for each component
-    std::vector<GroupInfo> groups;
-    int gid = 0;
-    for (auto& members : components) {
-        std::sort(members.begin(), members.end());
-        groups.push_back(make_group(gid++, members, dm));
-    }
-
-    return groups;
+    ThreadPool pool(num_threads);
+    return build_groups(components, dm, pool);
 }

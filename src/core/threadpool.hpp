@@ -50,6 +50,8 @@ public:
         return future;
     }
 
+    int size() const { return (int)workers_.size(); }
+
 private:
     std::vector<std::thread> workers_;
     std::queue<std::function<void()>> tasks_;

@@ -1,4 +1,5 @@
 #include "project.hpp"
+#include "parallel.hpp"
 
 #include <cmath>
 #include <algorithm>
@@ -82,6 +83,7 @@ ProjectionResult tsne_project(
     double perplexity,
     int max_iter,
     double learning_rate,
+    int num_threads,
     std::function<void(int,int)> progress_cb)
 {
     int n = (int)features.size();
@@ -90,32 +92,40 @@ ProjectionResult tsne_project(
     perplexity = std::min(perplexity, (double)(n - 1));
     if (perplexity < 1.0) perplexity = 1.0;
 
-    // 1. Pairwise squared distances in high-D
+    // One pool for the whole run: the gradient loop below re-enters it twice
+    // per iteration, so spawning threads per pass would cost more than the
+    // passes themselves.
+    ThreadPool pool(num_threads);
+
+    // 1. Pairwise squared distances in high-D.
+    //    Row i owns cells (i,j) and (j,i) for j > i — every cell written once.
     std::vector<std::vector<double>> D(n, std::vector<double>(n, 0.0));
-    for (int i = 0; i < n; i++)
+    parallel_for(pool, n, [&](int i) {
         for (int j = i + 1; j < n; j++) {
             double d = sq_dist(features[i], features[j]);
             D[i][j] = d;
             D[j][i] = d;
         }
+    });
 
-    // 2. Compute conditional probabilities p(j|i)
+    // 2. Compute conditional probabilities p(j|i).
+    //    Each row runs its own independent binary search over sigma_i.
     std::vector<std::vector<double>> P(n, std::vector<double>(n, 0.0));
-    for (int i = 0; i < n; i++) {
+    parallel_for(pool, n, [&](int i) {
         compute_pij_row(D[i], i, n, perplexity, P[i]);
-    }
+    });
 
     // 3. Symmetrize: P_ij = (p(j|i) + p(i|j)) / (2n)
-    for (int i = 0; i < n; i++) {
+    parallel_for(pool, n, [&](int i) {
         for (int j = i + 1; j < n; j++) {
             double sym = (P[i][j] + P[j][i]) / (2.0 * n);
             P[i][j] = sym;
             P[j][i] = sym;
         }
-    }
+    });
 
     // 4. Initialize low-D positions via PCA
-    auto pca_init = pca_project(features, dims);
+    auto pca_init = pca_project(features, dims, num_threads);
     std::vector<std::vector<double>> Y = pca_init.points;
 
     // Scale down PCA initialization
@@ -135,32 +145,42 @@ ProjectionResult tsne_project(
     std::vector<std::vector<double>> Y_prev(n, std::vector<double>(dims, 0.0));
     std::vector<std::vector<double>> grad(n, std::vector<double>(dims, 0.0));
 
+    // Reused across iterations: reallocating an n x n matrix every iteration
+    // dominates the loop once n gets large. The diagonal stays 0 throughout and
+    // every off-diagonal cell is overwritten each pass, so no clearing needed.
+    std::vector<std::vector<double>> Q_num(n, std::vector<double>(n, 0.0));
+    std::vector<double> q_partial(n, 0.0);
+
     // 5. Gradient descent
     for (int iter = 0; iter < max_iter; iter++) {
         // Early exaggeration: multiply P by 4 for first 250 iterations
         double exaggeration = (iter < 250) ? 4.0 : 1.0;
         double momentum = (iter < 250) ? 0.5 : 0.8;
 
-        // Compute Q (Student-t with 1 DOF)
-        std::vector<std::vector<double>> Q_num(n, std::vector<double>(n, 0.0));
-        double Q_sum = 0.0;
-
-        for (int i = 0; i < n; i++) {
+        // Compute Q (Student-t with 1 DOF). Each row accumulates its own slice
+        // of the normaliser; summing those slices in row order afterwards keeps
+        // Q_sum independent of how the rows were scheduled, so runs stay
+        // reproducible regardless of thread count.
+        parallel_for(pool, n, [&](int i) {
+            double partial = 0.0;
             for (int j = i + 1; j < n; j++) {
                 double d = sq_dist(Y[i], Y[j]);
                 double q = 1.0 / (1.0 + d);
                 Q_num[i][j] = q;
                 Q_num[j][i] = q;
-                Q_sum += 2.0 * q;
+                partial += 2.0 * q;
             }
-        }
+            q_partial[i] = partial;
+        });
+
+        double Q_sum = 0.0;
+        for (int i = 0; i < n; i++) Q_sum += q_partial[i];
         if (Q_sum < 1e-300) Q_sum = 1e-300;
 
-        // Compute gradients
-        for (int i = 0; i < n; i++)
+        // Compute gradients — row i touches only grad[i], so no accumulation
+        // races and no need to zero it first.
+        parallel_for(pool, n, [&](int i) {
             std::fill(grad[i].begin(), grad[i].end(), 0.0);
-
-        for (int i = 0; i < n; i++) {
             for (int j = 0; j < n; j++) {
                 if (i == j) continue;
                 double q_ij = Q_num[i][j] / Q_sum;
@@ -169,7 +189,7 @@ ProjectionResult tsne_project(
                     grad[i][d] += mult * (Y[i][d] - Y[j][d]);
                 }
             }
-        }
+        });
 
         // Update with momentum and adaptive gains
         for (int i = 0; i < n; i++) {
